@@ -1,0 +1,15 @@
+import: definition.yaml
+
+concurrency:
+  task:
+    webshop-env_train: 10
+  agent:
+    qwen3-4b-instruct: 10
+
+assignments:
+  - agent:
+      - qwen3-4b-instruct
+    task:
+      - webshop-env_train
+
+output: "outputs/{TIMESTAMP}"
