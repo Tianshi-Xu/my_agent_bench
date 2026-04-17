@@ -59,13 +59,32 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
         total = sum(1 for x in results if x)
         passed = sum(1 for x in results if is_pass(x))
         wrong = total - passed
+
+        usages = [
+            x.result.get("token_usage", {})
+            for x in results
+            if x and isinstance(x.result, dict)
+        ]
+        n_ep = len(usages) or 1
+        total_prompt = sum(u.get("prompt_tokens", 0) for u in usages)
+        total_completion = sum(u.get("completion_tokens", 0) for u in usages)
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages)
+
         return {
             "overall": {
                 "total": total,
                 "pass": passed,
                 "wrong": wrong,
                 "success_rate": passed / total if total else 0,
-            }
+            },
+            "token_usage": {
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_tokens,
+                "avg_prompt_tokens_per_episode": round(total_prompt / n_ep),
+                "avg_completion_tokens_per_episode": round(total_completion / n_ep),
+                "avg_total_tokens_per_episode": round(total_tokens / n_ep),
+            },
         }
     if task_name.startswith("webshop"):
         rel = [x.result for x in results if x and isinstance(x.result, dict)]
@@ -261,13 +280,18 @@ class TaskClient:
         latest_output = _normalize_output(start_payload)
         api_messages = copy.deepcopy(start_payload.get("messages", []))
         api_tools = start_payload.get("tools")
+        # Accumulate LLM token usage across all turns in this episode.
+        _ep_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         while SampleStatus(latest_output.status) == SampleStatus.RUNNING:
             if use_header_sid and hasattr(agent, "inference_openai"):
                 try:
-                    assistant_msg = agent.inference_openai(api_messages, api_tools)
+                    assistant_msg, _turn_usage = agent.inference_openai(api_messages, api_tools)
+                    for _k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        _ep_usage[_k] += _turn_usage.get(_k, 0)
                 except AgentContextLimitException:
                     assistant_msg = {"role": "assistant", "content": ""}
+                    _turn_usage = {}
                 except Exception as e:
                     if hasattr(agent, "model_name"):
                         model_name = agent.model_name
@@ -365,7 +389,7 @@ class TaskClient:
             return TaskClientOutput(
                 output=TaskOutput(
                     status=latest_output.status,
-                    result={**base, "openai_messages": api_messages},
+                    result={**base, "openai_messages": api_messages, "token_usage": _ep_usage},
                     history=_openai_trace_to_history(api_messages),
                 )
             )

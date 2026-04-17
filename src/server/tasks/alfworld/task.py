@@ -236,6 +236,12 @@ class ALFWorld(Task):
                 log_info["harness_trace"]["h5"].append(item)
 
         # interact
+        # Cache admissible commands from the previous env step so they are
+        # available even on turns where the agent makes no tool call.
+        _last_admissible: List[str] = initial_admissible
+        # Count consecutive turns with no tool call so we can escalate hints.
+        _no_tool_consecutive: int = 0
+
         for i in range(0, self.max_step):
             output = session.sync_action()
 
@@ -244,13 +250,34 @@ class ALFWorld(Task):
                 tool_calls.extend(message.get('tool_calls', []) or [])
 
             if not tool_calls:
+                _no_tool_consecutive += 1
                 finish_reason = SampleStatus.AGENT_VALIDATION_FAILED
+                no_exec_msg = (
+                    'You MUST call the take_action tool — '
+                    'do NOT output plain text without a tool call.'
+                )
+                # After 2+ consecutive no-tool turns, inject a directed step hint
+                # so the agent has a concrete action to take rather than narrating.
+                if (
+                    _no_tool_consecutive >= 2
+                    and harness_runtime
+                    and self.harness_config.h5_enabled
+                ):
+                    forced_hint = harness_runtime.step_guidance(
+                        current_round=i + 1,
+                        max_step=self.max_step,
+                        admissible=_last_admissible,
+                    )
+                    if forced_hint:
+                        no_exec_msg = no_exec_msg + '\n' + forced_hint
                 session.inject(ChatCompletionUserMessageParam(
                     role='user',
-                    content='No executable tool calls found. Please call a tool instead'
+                    content=no_exec_msg,
                 ))
                 session.inject(RewardHistoryItem(reward=0, score=0))
                 continue
+
+            _no_tool_consecutive = 0
 
             try:
                 tool_call = tool_calls[0]
@@ -298,10 +325,11 @@ class ALFWorld(Task):
 
             observation, reward, done, info = self.env.step_env(env, action)
             observation, reward, done = process_ob(observation[0]), info['won'][0], done[0]
+            _last_admissible = info.get('admissible_commands', [[]])[0]
             session.inject(ChatCompletionToolMessageParam(
                 role='tool',
                 tool_call_id=call_id,
-                content=observation + self.get_available_actions(info.get('admissible_commands', [[]])[0])
+                content=observation + self.get_available_actions(_last_admissible)
             ))
             round_reward = reward
             if "Nothing happens" in observation:

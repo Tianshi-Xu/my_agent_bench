@@ -159,6 +159,7 @@ class ALFWorldHarnessConfig:
     # H6
     h6_warn_threshold: int = 7       # remaining steps < N → inject urgency hint
     h6_force_threshold: int = 4      # remaining steps < N → force PUT if possible
+    h6_warn_threshold_multistep: int = 12  # higher warn for pick_two_obj / pick_cool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,7 +365,9 @@ class WorldModel:
     target_found: bool = False
     target_location: Optional[str] = None
     placed_count: int = 0
-    placed_locations: List[str] = field(default_factory=list)  # destination locs used so far
+    placed_locations: List[str] = field(default_factory=list)  # destination locs (for hint filter)
+    placed_items: List[str] = field(default_factory=list)       # specific item names we placed
+    lamp_location: Optional[str] = None  # location where desklamp was turned on (look_at_obj)
 
     def update(
         self,
@@ -385,17 +388,17 @@ class WorldModel:
             if loc in self.unvisited:
                 self.unvisited.remove(loc)
 
-        # Inventory: "you pick up the X from"
+        # Inventory: "you pick up the X from Y"
         pick_m = re.search(r"you pick up the (.+?) from", obs_lower)
         if pick_m:
             self.inventory = pick_m.group(1).strip()
 
-        # Inventory: "you put the X in/on the Y" → drop item
+        # Inventory: "you put the X in/on the Y" → drop item, record what/where
         if act_lower.startswith("put ") and re.search(r"you put the .+? (?:in|on) ", obs_lower):
+            if self.inventory and self.inventory not in self.placed_items:
+                self.placed_items.append(self.inventory)   # remember this specific item
             self.inventory = None
             self.placed_count += 1
-            # Record where we just placed an item so future hints can avoid pointing
-            # back to this location as a search target (relevant for pick_two_obj).
             if self.current_location and self.current_location not in self.placed_locations:
                 self.placed_locations.append(self.current_location)
 
@@ -404,7 +407,13 @@ class WorldModel:
             for obj in _extract_objects(observation):
                 if obj not in self.object_at:
                     self.object_at[obj] = self.current_location
-                if target_type and not self.target_found and target_type.lower() in obj:
+                # P3 (revised): exclude specific items we have already placed —
+                # not locations, so naturally-present items at the destination
+                # can still be detected as new targets.
+                if (target_type
+                        and not self.target_found
+                        and target_type.lower() in obj
+                        and obj not in self.placed_items):
                     self.target_found = True
                     self.target_location = self.current_location
 
@@ -429,9 +438,47 @@ class WorldModel:
         return sorted(self.unvisited, key=rank)
 
     def find_take_action(self, target_type: str, admissible: List[str]) -> Optional[str]:
+        """Return a take action for target_type, skipping already-placed items and locations.
+
+        Two filters prevent the second-cycle loop in pick_two_obj:
+          1. placed_items  — skip named items we already placed ("take soapbottle 2 from ...")
+          2. placed_locations — skip any take action whose source is a destination we placed at
+             ("take tissuebox 2 from shelf 2" where shelf 2 is where we deposited item 1).
+             This prevents the agent from picking up an item that was already at the destination
+             (either naturally or placed there by us) and re-placing it there.
+        """
+        tt_lower = target_type.lower()
+        placed_lower = [p.lower() for p in self.placed_items]
+        placed_loc_lower = [loc.lower() for loc in self.placed_locations]
         for a in admissible:
-            if a.startswith("take ") and target_type.lower() in a.lower():
-                return a
+            if not a.startswith("take ") or tt_lower not in a.lower():
+                continue
+            # Skip if this action targets a specific item we've already placed
+            if any(p in a.lower() for p in placed_lower):
+                continue
+            # Skip if the source location is somewhere we've already deposited an item.
+            # Regex: "take X from <source>" — source is everything after " from "
+            src_m = re.search(r" from (.+)$", a.lower())
+            if src_m:
+                src = src_m.group(1).strip()
+                if any(src == loc or src.startswith(loc) for loc in placed_loc_lower):
+                    continue
+            return a
+        return None
+
+    def find_known_target_location(self, target_type: str) -> Optional[str]:
+        """Return a previously-observed location of target_type, excluding placed_items.
+
+        Uses object_at (which is cleared when the agent picks up an item) to
+        give a direct FIND hint for items the agent has already seen but not yet taken.
+        """
+        tt_lower = target_type.lower()
+        held = (self.inventory or "").lower()
+        for obj_name, loc in self.object_at.items():
+            if (tt_lower in obj_name.lower()
+                    and obj_name not in self.placed_items
+                    and obj_name.lower() != held):
+                return loc
         return None
 
     def find_put_action(self, dest_type: str, admissible: List[str]) -> Optional[str]:
@@ -455,8 +502,14 @@ class WorldModel:
         return None
 
     def find_examine_action(self, target_type: str, admissible: List[str]) -> Optional[str]:
+        """Return the 'examine X with desklamp' action, or None.
+
+        We explicitly require 'desklamp' in the action string: plain 'examine X'
+        (without the lamp) gives 'There's nothing special' and never completes
+        the task, so offering it as a hint would create an infinite loop.
+        """
         for a in admissible:
-            if "examine" in a and target_type.lower() in a.lower():
+            if "examine" in a and target_type.lower() in a.lower() and "desklamp" in a.lower():
                 return a
         return None
 
@@ -535,6 +588,7 @@ class ALFWorldHarnessRuntime:
     # H4 state
     last_outputs: List[str] = field(default_factory=list)
     last_observations: List[str] = field(default_factory=list)  # P1-1: for nothing-happens check
+    last_actions: List[str] = field(default_factory=list)        # for non-advancing loop detection
     soft_intervention_count: int = 0
     post_put_grace: int = 0
 
@@ -546,6 +600,9 @@ class ALFWorldHarnessRuntime:
     # H5 step-guidance dedup state
     _last_step_hint: Optional[str] = field(default=None)
     _last_step_hint_sg_idx: int = field(default=-1)
+    # H5 specific-action hint enforcement: track when agent ignores "use: X" hints
+    _last_specific_action_hint: Optional[str] = field(default=None)  # the action string from "use: X"
+    _specific_action_ignored_count: int = field(default=0)            # consecutive ignores
 
     # ── H0 ───────────────────────────────────────────────────────────────────
 
@@ -653,6 +710,8 @@ class ALFWorldHarnessRuntime:
 
         elif sg == _SG_USE_LAMP:
             if "you turn on" in obs_lower or "you switch on" in obs_lower:
+                # Record where the lamp is so the EXAMINE hint can direct the agent back.
+                self.world.lamp_location = self.world.current_location
                 self._subgoal_idx += 1
 
         elif sg == _SG_EXAMINE:
@@ -764,6 +823,13 @@ class ALFWorldHarnessRuntime:
             self.world.update(final_action, observation, admissible, self.task_ctx.target_type)
             self._advance_subgoal(final_action, observation, admissible)
 
+        # H5 enforcement: if agent just executed the recommended specific action, reset tracker
+        if (self._last_specific_action_hint
+                and final_action
+                and final_action.strip().lower() == self._last_specific_action_hint.lower()):
+            self._last_specific_action_hint = None
+            self._specific_action_ignored_count = 0
+
         # Decrement post-PUT grace period
         if self.post_put_grace > 0:
             self.post_put_grace -= 1
@@ -778,6 +844,11 @@ class ALFWorldHarnessRuntime:
         win = self.config.h4_nothing_happens_window
         if len(self.last_observations) > win:
             self.last_observations = self.last_observations[-win:]
+
+        act_lower = (final_action or "").strip().lower()
+        self.last_actions.append(act_lower)
+        if len(self.last_actions) > 6:
+            self.last_actions = self.last_actions[-6:]
 
         response: Dict[str, Any] = {
             "stall_score": 0,
@@ -814,24 +885,161 @@ class ALFWorldHarnessRuntime:
         if in_grace or sg_done:
             return response
 
-        # P1-1: "Nothing happens" loop — agent is not holding anything but keeps issuing
-        # put/take actions that have no effect.  This pattern is missed by the standard
-        # repeated_action check because the agent may alternate between navigation and put.
+        # L1: "examine without lamp" loop — agent in EXAMINE subgoal is repeatedly doing
+        # plain "examine X" (not "examine X with desklamp"), getting "nothing special".
+        # This fires before the generic stall check so recovery is more specific.
+        if self._current_subgoal() == _SG_EXAMINE and self.world.inventory is not None:
+            nothing_special_count = sum(
+                1 for obs in self.last_observations
+                if "nothing special" in obs
+            )
+            if nothing_special_count >= 2:
+                tt = self.task_ctx.target_type if self.task_ctx else "the object"
+                lamp_loc = self.world.lamp_location
+                response["stall_score"] = 2
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "examine_without_lamp"
+                response["recovery_prompt"] = (
+                    f"Harness: 'examine {tt}' without the desklamp does nothing. "
+                    + (f"Go to {lamp_loc} — " if lamp_loc else "Find the lit desklamp — ")
+                    + f"you must be AT the lit desklamp to examine {tt} with it."
+                )
+                self.last_observations.clear()
+                return response
+
+        # Navigation oscillation: agent is bouncing between ≤2 locations without
+        # making progress (A→B→A→B…). Distinct from the 3-identical-action terminator
+        # in task.py which only catches strictly repeated single actions.
+        recent_navs = [a for a in self.last_actions[-6:] if a.startswith("go to ")]
+        if len(recent_navs) >= 5:
+            unique_dests = set(recent_navs)
+            if len(unique_dests) <= 2 and self.task_ctx:
+                tt = self.task_ctx.target_type or "target"
+                sg_label = self._current_subgoal()
+                next_hint = ""
+                if sg_label in (_SG_FIND, _SG_TAKE) and self.world.unvisited:
+                    ordered = self.world.ordered_unvisited(tt)
+                    filtered = [loc for loc in ordered if loc not in self.world.placed_locations
+                                and loc not in unique_dests]
+                    if filtered:
+                        next_hint = f" Try: go to {filtered[0]}."
+                response["stall_score"] = 2
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "nav_oscillation"
+                response["recovery_prompt"] = (
+                    f"Harness: you are oscillating between the same locations. "
+                    f"The {tt} is not there — explore somewhere new.{next_hint}"
+                )
+                self.last_actions.clear()
+                return response
+
+        # Container open/close oscillation: agent is repeatedly opening and closing the
+        # same container without taking or placing anything. Common with fridge (pick_cool/
+        # pick_heat) when the agent doesn't know what to do at the container.
+        recent_oc = [a for a in self.last_actions[-6:]
+                     if a.startswith("open ") or a.startswith("close ")]
+        if len(recent_oc) >= 4 and self.task_ctx:
+            # Check if these open/close actions target ≤ 2 containers
+            targets = set(a.split(" ", 1)[1] for a in recent_oc)
+            if len(targets) <= 2:
+                tt = self.task_ctx.target_type or "target"
+                sg_label = self._current_subgoal()
+                xform = self.task_ctx.transformation
+                container = next(iter(targets))
+                response["stall_score"] = 2
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "container_oscillation"
+                if xform and sg_label in (_SG_GOTO_MCW, _SG_GOTO_FRG, _SG_GOTO_SINK):
+                    # Knows it needs the transformation but can't do it yet
+                    response["recovery_prompt"] = (
+                        f"Harness: you need to take the {tt} first before you can "
+                        f"{xform} it here. Find and pick up the {tt}, then return."
+                    )
+                elif sg_label in (_SG_GOTO_MCW, _SG_HEAT):
+                    response["recovery_prompt"] = (
+                        f"Harness: opening/closing {container} repeatedly does nothing. "
+                        f"Take {tt}, open {container}, then use 'heat {tt} with {container}'."
+                    )
+                elif sg_label in (_SG_GOTO_FRG, _SG_COOL):
+                    response["recovery_prompt"] = (
+                        f"Harness: opening/closing {container} repeatedly does nothing. "
+                        f"Take {tt}, open {container}, then use 'cool {tt} with {container}'."
+                    )
+                else:
+                    response["recovery_prompt"] = (
+                        f"Harness: opening/closing {container} repeatedly is not advancing "
+                        f"the task. Navigate elsewhere to find the {tt}."
+                    )
+                self.last_actions.clear()
+                return response
+
+        # Dead-end action loop: agent is cycling through examine / inventory / look
+        # without navigating. This is a distinct failure from the "nothing happens" loop:
+        # these actions DO return output but never advance the task. After 4 consecutive
+        # non-advancing actions, force a directed navigation hint.
+        _NON_ADVANCING = ("examine", "inventory", "look")
+        recent_na = [a for a in self.last_actions[-5:] if any(a.startswith(p) for p in _NON_ADVANCING)]
+        if len(recent_na) >= 4 and self.task_ctx:
+            sg_label = self._current_subgoal()
+            tt = self.task_ctx.target_type or "target"
+            # Build a directed recovery prompt with a concrete next action
+            next_hint = ""
+            if sg_label == _SG_FIND and self.world.unvisited:
+                ordered = self.world.ordered_unvisited(tt)
+                filtered = [loc for loc in ordered if loc not in self.world.placed_locations]
+                next_loc = (filtered[0] if filtered else ordered[0]) if ordered else self.world.unvisited[0]
+                next_hint = f" Navigate: go to {next_loc}."
+            elif sg_label == _SG_TAKE:
+                loc = self.world.target_location or self.world.find_known_target_location(tt)
+                if loc:
+                    next_hint = f" Go to {loc} to pick up the {tt}."
+            response["stall_score"] = 2
+            response["intervention_level"] = "soft"
+            response["audit_reason"] = "dead_end_loop"
+            response["recovery_prompt"] = (
+                f"Harness: examine/inventory/look are not advancing the task. "
+                f"Stop checking and take a navigation action.{next_hint}"
+            )
+            self.last_actions.clear()
+            return response
+
+        # P1-1: "Nothing happens" loop — keep issuing put/take actions that have no effect.
         nothing_happens_count = sum(
             1 for obs in self.last_observations
             if "nothing happens" in obs
         )
-        if (nothing_happens_count >= self.config.h4_nothing_happens_threshold
-                and self.world.inventory is None):
-            tt = self.task_ctx.target_type if self.task_ctx else "the target object"
-            response["stall_score"] = 2
-            response["intervention_level"] = "soft"
-            response["audit_reason"] = "nothing_happens_loop"
-            response["recovery_prompt"] = (
-                f"Harness: you are not holding anything — put actions have no effect. "
-                f"Find and pick up the {tt} before trying to place it."
-            )
-            # Reset observation window so we don't fire repeatedly on the same episode
+        if nothing_happens_count >= self.config.h4_nothing_happens_threshold and self.task_ctx:
+            tt = self.task_ctx.target_type or "the target object"
+            xform = self.task_ctx.transformation
+            sg_label = self._current_subgoal()
+            if self.world.inventory is None:
+                response["stall_score"] = 2
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "nothing_happens_loop"
+                response["recovery_prompt"] = (
+                    f"Harness: you are not holding anything — put actions have no effect. "
+                    f"Find and pick up the {tt} before trying to place it."
+                )
+            elif xform and sg_label in (_SG_GOTO_DEST, _SG_PUT, _SG_GOTO_SINK,
+                                        _SG_GOTO_MCW, _SG_GOTO_FRG):
+                # Holding the item but put fails → likely skipped the transformation step
+                xform_loc = _XFORM_LOCATION.get(xform, xform)
+                response["stall_score"] = 2
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "put_skipped_transform"
+                response["recovery_prompt"] = (
+                    f"Harness: putting {self.world.inventory} is failing — "
+                    f"you must {xform} it first. "
+                    f"Go to {xform_loc} and use the '{xform}' action before placing it."
+                )
+            else:
+                response["stall_score"] = 1
+                response["intervention_level"] = "soft"
+                response["audit_reason"] = "nothing_happens_loop"
+                response["recovery_prompt"] = (
+                    f"Harness: actions are not taking effect. "
+                    f"Try a different approach or navigate elsewhere."
+                )
             self.last_observations.clear()
             return response
 
@@ -940,18 +1148,35 @@ class ALFWorldHarnessRuntime:
                         f"Hint: {tt} was spotted at {world.target_location}. "
                         f"Navigate there and take it."
                     )
-                elif world.unvisited:
-                    ordered = world.ordered_unvisited(tt)
-                    # P1-2: exclude already-placed destination locations from search hints
-                    # (avoids directing agent back to spot where it just deposited an item).
-                    filtered = [loc for loc in ordered if loc not in world.placed_locations]
-                    next_loc = (filtered[0] if filtered else ordered[0]) if ordered else world.unvisited[0]
-                    hint = f"Hint: {tt} not found yet. Suggested next: go to {next_loc}."
+                else:
+                    # object_at: check if we have already observed target_type somewhere
+                    # (e.g., pick_two_obj second cycle where we saw the second item earlier).
+                    # Excludes placed_locations so we never point back to our own deposits.
+                    known_loc = world.find_known_target_location(tt)
+                    if known_loc:
+                        hint = (
+                            f"Hint: {tt} was previously seen at {known_loc}. "
+                            f"Go there and take it."
+                        )
+                    elif world.unvisited:
+                        ordered = world.ordered_unvisited(tt)
+                        # P1-2: exclude already-placed destination locations from search hints
+                        filtered = [loc for loc in ordered if loc not in world.placed_locations]
+                        next_loc = (filtered[0] if filtered else ordered[0]) if ordered else world.unvisited[0]
+                        hint = f"Hint: {tt} not found yet. Suggested next: go to {next_loc}."
 
         elif sg == _SG_TAKE:
             take_a = world.find_take_action(tt, admissible)
             if take_a:
                 hint = f"Hint: pick up the {tt} — use: {take_a}."
+            else:
+                # Take action not yet in admissible — agent is not at target location.
+                loc = world.target_location or world.find_known_target_location(tt)
+                if loc:
+                    hint = (
+                        f"Hint: you are not at the {tt}'s location. "
+                        f"Go to {loc} first, then pick up the {tt}."
+                    )
 
         elif sg == _SG_GOTO_SINK:
             if not any(a.startswith("clean ") for a in admissible):
@@ -999,16 +1224,26 @@ class ALFWorldHarnessRuntime:
         elif sg == _SG_EXAMINE:
             ex_a = world.find_examine_action(tt, admissible)
             if ex_a:
-                # P0-3: be explicit — agent must use the full "examine X with desklamp" form.
+                # find_examine_action only returns the "with desklamp" form, so this is exact.
                 hint = f"Hint: use exactly: {ex_a}."
             elif world.inventory:
-                # Holding the item but examine not yet available — guide back to lamp.
-                hint = (
-                    f"Hint: you are holding {world.inventory}. "
-                    f"Use 'examine {tt} with desklamp' to complete the task."
-                )
+                # Holding the target but "examine X with desklamp" is not in admissible —
+                # agent is not at the lamp location. Direct it back.
+                if world.lamp_location:
+                    hint = (
+                        f"Hint: go to {world.lamp_location} first — "
+                        f"'examine {tt} with desklamp' only works when you are at the lit lamp."
+                    )
+                else:
+                    hint = (
+                        f"Hint: find the lit desklamp and go to it — "
+                        f"then use 'examine {tt} with desklamp' to complete the task."
+                    )
 
         if hint is None:
+            # If we have a pending specific action, agent might have just done it
+            self._last_specific_action_hint = None
+            self._specific_action_ignored_count = 0
             return None
         hint = _truncate_to_word_budget(hint, self.config.h5_step_hint_max_words)
 
@@ -1016,7 +1251,30 @@ class ALFWorldHarnessRuntime:
         sg_changed = (self._subgoal_idx != self._last_step_hint_sg_idx)
         content_changed = (hint != self._last_step_hint)
         if not sg_changed and not content_changed:
+            # Same hint as last turn — agent didn't follow it.
+            # If this hint contains a specific "use: X" action, track ignores
+            # and force via force_next_action on the 2nd consecutive ignore.
+            if self._last_specific_action_hint:
+                self._specific_action_ignored_count += 1
+                if self._specific_action_ignored_count >= 2:
+                    self.force_next_action = self._last_specific_action_hint
+                    self._specific_action_ignored_count = 0
+                    self._last_specific_action_hint = None
             return None
+
+        # Extract specific action from "use: <action>" phrasing for enforcement tracking
+        use_m = re.search(r"use: (.+?)\.?$", hint)
+        if use_m:
+            candidate = use_m.group(1).strip().rstrip(".")
+            # Only enforce if action is actually in admissible (safety check)
+            if any(candidate.lower() == a.lower() for a in admissible):
+                self._last_specific_action_hint = candidate
+                self._specific_action_ignored_count = 0
+            else:
+                self._last_specific_action_hint = None
+        else:
+            self._last_specific_action_hint = None
+            self._specific_action_ignored_count = 0
 
         self._last_step_hint = hint
         self._last_step_hint_sg_idx = self._subgoal_idx
@@ -1053,8 +1311,13 @@ class ALFWorldHarnessRuntime:
                     )
                     return response
 
-        # Soft warn: still searching with few steps left
-        if remaining_steps < self.config.h6_warn_threshold and sg == _SG_FIND:
+        # Soft warn: still searching with few steps left.
+        # Multi-step tasks (pick_two_obj: 2 full cycles; pick_cool: extra fridge detour)
+        # need more buffer, so their effective warn threshold is raised.
+        warn_threshold = self.config.h6_warn_threshold
+        if self.task_ctx.task_type in ("pick_two_obj", "pick_cool_then_place"):
+            warn_threshold = max(warn_threshold, self.config.h6_warn_threshold_multistep)
+        if remaining_steps < warn_threshold and sg == _SG_FIND:
             ordered = world.ordered_unvisited(tt)
             top = ordered[:2] if ordered else []
             if top:

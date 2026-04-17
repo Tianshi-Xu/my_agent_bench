@@ -249,6 +249,7 @@ class HTTPAgent(AgentClient):
                 msg = data["choices"][0]["message"]
                 if not isinstance(msg, dict):
                     raise Exception(f"Unexpected message shape: {msg!r}")
-                return msg
+                usage = data.get("usage") or {}
+                return msg, usage
             time.sleep(_ + 2)
         raise Exception("Failed.")
