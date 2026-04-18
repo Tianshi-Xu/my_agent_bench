@@ -92,6 +92,8 @@ services:
       mode: replicated
       replicas: 1
     volumes:
+      - ../configs:/app/configs
+      - ../src/server/tasks/webshop:/app/src/server/tasks/webshop
       - ../src/server/harness:/app/src/server/harness
     depends_on:
       - controller

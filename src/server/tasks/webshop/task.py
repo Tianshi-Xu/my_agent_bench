@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Dict, List, Any
 from uuid import uuid4
 
@@ -14,24 +15,73 @@ from openai.types.chat import (ChatCompletionSystemMessageParam,
                                ChatCompletionUserMessageParam)
 from web_agent_site.envs.web_agent_text_env import WebAgentTextEnv
 
-prompt_with_max_turn = """
-You are web shopping.
-I will give you instructions about what to do.
-You have to follow the instructions.
-Every round I will give you an observation and a list of available actions,
-you have to respond with calling a tool provided based on the state and instruction.
-You can use search tool if search is available.
-You can click one of the buttons in clickables.
-If the action is not valid, perform nothing.
-Keywords in search are up to you, but the value in click must be a value in the list of available actions.
-Remember that your keywords in search should be carefully designed.
-Your should first think about what to do, then call a tool correspondingly.
-You should always use a tool, even if you have questions to confirm. You can use whatever tool is available and do not need permission from the user.
+from src.server.harness import (
+    WebShopHarnessConfig,
+    WebShopHarnessRuntime,
+    patch_webshop_tool_descriptions,
+)
+
+prompt_with_max_turn = """You are a web shopping agent. Follow the task instruction to find and buy the correct product.
+
+CRITICAL RULES:
+1. You MUST call a tool EVERY turn. NEVER respond with only text — always call search_action or click_action.
+2. On search results: read product titles carefully. Click the product whose title best matches ALL key terms in the instruction (brand name, product type, specific features).
+3. On a product page: select ALL required attributes (color, size, etc.) THEN click 'buy now' immediately.
+4. After selecting attributes, click 'buy now' right away. Do NOT hesitate or deliberate — just buy.
+5. If the Hint says "All checked" or "All attributes selected", your ONLY correct action is click 'buy now'.
+6. Keywords in search should be the product name and key features, NOT prices or filler words.
+7. The click value MUST be exactly one of the available clickable values.
 """
+
+
+def _extract_instruction(observation: str) -> str:
+    """Parse the task instruction out of the initial WebShop observation.
+
+    WebShop text-mode format: "WebShop [SEP] Instruction: [SEP] <text> [SEP] Search"
+    """
+    # Primary: [SEP]-delimited format used by WebShop text env
+    m = re.search(r"Instruction:\s*\[SEP\]\s*(.+?)\s*\[SEP\]", observation, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fallback: newline-delimited format
+    m = re.search(r"Instruction:\s*\n(.+?)(?:\n\n|\[|$)", observation, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return observation[:300]
+
+
+def _parse_available_actions(available_actions) -> tuple:
+    """Return (has_search_bar: bool, clickables: list[str]) from env response."""
+    if isinstance(available_actions, dict):
+        return (
+            bool(available_actions.get("has_search_bar", False)),
+            list(available_actions.get("clickables", [])),
+        )
+    return False, []
 
 
 class WebShop(Task):
     def __init__(self, tools=None, **configs):
+        # Extract harness config params before passing configs to super()
+        enabled = configs.pop("enabled", False)
+        h2 = configs.pop("h2", True)
+        h3 = configs.pop("h3", True)
+        h4 = configs.pop("h4", True)
+        h5 = configs.pop("h5", True)
+        h6 = configs.pop("h6", True)
+        h5_top_k = configs.pop("h5_top_k", 2)
+        self.harness_config = WebShopHarnessConfig(
+            enabled=bool(enabled),
+            h2_enabled=bool(h2),
+            h3_enabled=bool(h3),
+            h4_enabled=bool(h4),
+            h5_enabled=bool(h5),
+            h6_enabled=bool(h6),
+            h5_top_k=int(h5_top_k),
+        )
+        if self.harness_config.enabled and self.harness_config.h3_enabled:
+            tools = patch_webshop_tool_descriptions(tools)
+
         super().__init__(**configs)
         self.logger = logging.getLogger(__name__)
         self.ranging = (configs.pop("start", 0), configs.pop("end", 500))
@@ -79,17 +129,51 @@ class WebShop(Task):
                 content=prompt_with_max_turn
             ))
 
+            # Harness: initialise per-episode runtime
+            harness_runtime = None
+            if self.harness_config.enabled:
+                harness_runtime = WebShopHarnessRuntime(config=self.harness_config)
+                harness_runtime.init_task(_extract_instruction(env.observation))
+
+            # H5 cold-start: inject skill hints BEFORE the first observation
+            if harness_runtime and self.harness_config.h5_enabled:
+                cold_skills = harness_runtime.cold_start_skill_hints()
+                if cold_skills:
+                    skill_lines = [f"- {item['text']}" for item in cold_skills]
+                    session.inject(ChatCompletionUserMessageParam(
+                        role='user',
+                        content="Shopping tips:\n" + "\n".join(skill_lines),
+                    ))
+
             action = None
             observation = env.observation
             reward = 0
             call_id = None
+            _no_tool_consecutive = 0
+
             for j in range(self.max_rounds):
                 available_actions = env.get_available_actions()
+                has_search_bar, clickables = _parse_available_actions(available_actions)
+
                 if j == 0:
                     session.inject(ChatCompletionUserMessageParam(
                         role='user',
                         content=f'The initial observation:\n{observation}\n\nAvailable Actions:\n{available_actions}'
                     ))
+                    # H5 cold-start: search hint on step 0
+                    if harness_runtime:
+                        first_hint = harness_runtime.step_guidance(
+                            step_num=0,
+                            max_steps=self.max_rounds,
+                            observation=observation,
+                            has_search_bar=has_search_bar,
+                            clickables=clickables,
+                        )
+                        if first_hint:
+                            session.inject(ChatCompletionUserMessageParam(
+                                role='user',
+                                content=first_hint,
+                            ))
                 else:
                     if action is None:
                         session.inject(ChatCompletionUserMessageParam(
@@ -111,9 +195,43 @@ class WebShop(Task):
 
                 finish_reason = SampleStatus.COMPLETED
                 if not tool_calls:
+                    _no_tool_consecutive += 1
                     action = None
-                    observation = "No executable tool calls found! You should call a tool instead."
+
+                    # Aggressive force: on product page with buy-now available,
+                    # force buy-now after just 1 text-only turn (saves 265+ wasted turns).
+                    buy_now_available = "buy now" in clickables
+                    if harness_runtime and buy_now_available and _no_tool_consecutive >= 1:
+                        # Force buy now immediately — the agent is deliberating uselessly
+                        harness_runtime.force_next_action = "click[buy now]"
+                        no_exec_msg = (
+                            "You must call a tool! Since 'buy now' is available, "
+                            "buying now. Call click_action with 'buy now' next turn."
+                        )
+                    elif harness_runtime and _no_tool_consecutive >= 2 and "back to search" in clickables:
+                        harness_runtime.force_next_action = "click[back to search]"
+                        no_exec_msg = (
+                            "You must call a tool! Forcing back to search."
+                        )
+                    elif harness_runtime and _no_tool_consecutive >= 1:
+                        # Immediate directive message
+                        if has_search_bar:
+                            no_exec_msg = (
+                                "You must call a tool! Use search_action to search for the product."
+                            )
+                        elif "back to search" in clickables:
+                            no_exec_msg = (
+                                "You must call a tool! Click 'back to search' or click a product."
+                            )
+                        else:
+                            no_exec_msg = (
+                                "You must call a tool! Click one of the available options."
+                            )
+                    else:
+                        no_exec_msg = "You must call a tool! NEVER respond with only text."
+                    observation = no_exec_msg
                 else:
+                    _no_tool_consecutive = 0
                     action = None
                     try:
                         tool_call = tool_calls[0]
@@ -122,10 +240,38 @@ class WebShop(Task):
                         arguments = json.loads(arguments)
                         arguments = list(arguments.values())
                         call_id = tool_call["id"]
-                        if func_name == "search_action":
-                            action = f"search[{arguments[0]}]"
-                        elif func_name == "click_action":
-                            action = f"click[{arguments[0]}]"
+
+                        if harness_runtime and self.harness_config.h2_enabled:
+                            raw_value = arguments[0]
+                            h2_result = harness_runtime.pre_validate_action(
+                                tool_name=func_name,
+                                raw_value=raw_value,
+                                has_search_bar=has_search_bar,
+                                clickables=clickables,
+                            )
+                            if h2_result["blocked"]:
+                                reason = h2_result["reason"]
+                                # Use custom block_message if available (e.g. buy-now pre-check)
+                                if "block_message" in h2_result:
+                                    block_msg = h2_result["block_message"]
+                                elif "search_not_available" in reason:
+                                    block_msg = "Search is not available on this page. Click one of the available options."
+                                elif "repeat_click" in reason:
+                                    block_msg = f"You already clicked '{raw_value}'. Choose a different action."
+                                else:
+                                    block_msg = f"Invalid action: {reason}. Please choose a valid action from available options."
+                                session.inject(ChatCompletionUserMessageParam(
+                                    role='user',
+                                    content=block_msg,
+                                ))
+                                session.inject(RewardHistoryItem(reward=0, score=0))
+                                continue
+                            action = h2_result["action"]
+                        else:
+                            if func_name == "search_action":
+                                action = f"search[{arguments[0]}]"
+                            elif func_name == "click_action":
+                                action = f"click[{arguments[0]}]"
                     except:
                         self.logger.warning(f'Error processing tool call. {tool_calls=}', exc_info=True)
                         session.inject(ChatCompletionUserMessageParam(
@@ -134,6 +280,7 @@ class WebShop(Task):
                         ))
                         session.inject(RewardHistoryItem(reward=0, score=0))
                         continue
+
                 history.append(
                     {
                         "observation": observation,
@@ -142,6 +289,7 @@ class WebShop(Task):
                         "action": action,
                     }
                 )
+
                 if not action:
                     reward = 0
                     done = False
@@ -149,6 +297,52 @@ class WebShop(Task):
                 else:
                     observation, reward, done, info = env.step(action)
                     round_reward = reward
+
+                    if harness_runtime:
+                        # Get post-step available actions for harness checks
+                        post_available = env.get_available_actions()
+                        post_has_sb, post_clickables = _parse_available_actions(post_available)
+
+                        # H1: update page state
+                        harness_runtime.update_state(action, observation, post_has_sb, post_clickables)
+
+                        # H4: shopping monitor
+                        h4_result = harness_runtime.post_step_monitor(
+                            action, observation, post_has_sb, post_clickables
+                        )
+                        if h4_result.get("recovery_prompt"):
+                            session.inject(ChatCompletionUserMessageParam(
+                                role='user',
+                                content=h4_result["recovery_prompt"],
+                            ))
+
+                        # H5: goal-directed hint
+                        h5_hint = harness_runtime.step_guidance(
+                            step_num=j + 1,
+                            max_steps=self.max_rounds,
+                            observation=observation,
+                            has_search_bar=post_has_sb,
+                            clickables=post_clickables,
+                        )
+                        if h5_hint:
+                            session.inject(ChatCompletionUserMessageParam(
+                                role='user',
+                                content=h5_hint,
+                            ))
+
+                        # H6: budget management
+                        h6_result = harness_runtime.budget_check(
+                            remaining_steps=self.max_rounds - j - 1,
+                            clickables=post_clickables,
+                        )
+                        if h6_result.get("force_action"):
+                            harness_runtime.force_next_action = h6_result["force_action"]
+                        if h6_result.get("hint"):
+                            session.inject(ChatCompletionUserMessageParam(
+                                role='user',
+                                content=h6_result["hint"],
+                            ))
+
                 history[-1]["reward"] = reward
                 history[-1]["done"] = done
                 rewardhistory = RewardHistoryItem(reward=round_reward, score=round_reward)
