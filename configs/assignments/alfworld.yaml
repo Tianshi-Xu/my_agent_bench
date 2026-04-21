@@ -15,3 +15,5 @@ assignments:
       # - alfworld-env_train
 
 output: "outputs/alfworld/{TIMESTAMP}"
+
+trials: 5

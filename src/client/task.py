@@ -22,10 +22,12 @@ def _slim_outputs_for_worker_aggregate(results: List[TaskOutput]) -> List[TaskOu
                 for k in ("reward", "result", "metrics")
                 if k in r.result
             }
+        # Strip trial dimension from compound index before sending to worker.
+        idx = r.index[0] if isinstance(r.index, list) and len(r.index) == 2 else r.index
         slim.append(
             TaskOutput(
                 status=r.status,
-                index=r.index,
+                index=idx,
                 result=keep,
                 history=[],
             )
@@ -33,7 +35,42 @@ def _slim_outputs_for_worker_aggregate(results: List[TaskOutput]) -> List[TaskOu
     return slim
 
 
-def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
+def _compute_trial_metrics(
+    results: List["TaskOutput"],
+    is_pass_fn,
+    trials: int,
+) -> dict:
+    groups: dict = {}
+    for r in results:
+        if isinstance(r.index, list) and len(r.index) == 2:
+            base, t = r.index[0], r.index[1]
+        else:
+            continue
+        groups.setdefault(base, []).append((t, r))
+    groups = {base: [r for _, r in sorted(entries)] for base, entries in groups.items()}
+    n_q = len(groups)
+    if n_q == 0:
+        return {}
+    all_scores = [1.0 if is_pass_fn(r) else 0.0 for g in groups.values() for r in g]
+    avg_at_k = sum(all_scores) / len(all_scores) if all_scores else 0
+    pass_at_k = sum(1 for g in groups.values() if any(is_pass_fn(r) for r in g)) / n_q
+    pass_power = {}
+    for j in range(2, trials + 1):
+        count = sum(
+            1 for g in groups.values()
+            if len(g) >= j and all(is_pass_fn(r) for r in g[:j])
+        )
+        pass_power[f"pass^{j}"] = round(count / n_q, 4)
+    return {
+        "trials": trials,
+        "questions": n_q,
+        "avg_at_k": round(avg_at_k, 4),
+        "pass_at_k": round(pass_at_k, 4),
+        "pass_power": pass_power,
+    }
+
+
+def _local_calculate_overall(task_name: str, results: List[TaskOutput], trials: int = 1) -> dict:
     """Mirror server task aggregate logic when controller/worker HTTP is unavailable."""
     if task_name.startswith("alfworld"):
         def is_pass(x: TaskOutput) -> bool:
@@ -70,13 +107,16 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
         total_completion = sum(u.get("completion_tokens", 0) for u in usages)
         total_tokens = sum(u.get("total_tokens", 0) for u in usages)
 
+        overall = {
+            "total": total,
+            "pass": passed,
+            "wrong": wrong,
+            "success_rate": passed / total if total else 0,
+        }
+        if trials > 1:
+            overall.update(_compute_trial_metrics(results, is_pass, trials))
         return {
-            "overall": {
-                "total": total,
-                "pass": passed,
-                "wrong": wrong,
-                "success_rate": passed / total if total else 0,
-            },
+            "overall": overall,
             "token_usage": {
                 "total_prompt_tokens": total_prompt,
                 "total_completion_tokens": total_completion,
@@ -93,15 +133,41 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
         completed = sum(1 for x in results if x and x.status == SampleStatus.COMPLETED)
         success_at_1 = sum(1 for r in rewards if float(r) >= 1.0)
         avg = sum(rewards) / len(rewards) if rewards else 0
+        usages = [x.get("token_usage", {}) for x in rel]
+        n_ep = len(usages) or 1
+        total_prompt = sum(u.get("prompt_tokens", 0) for u in usages if u)
+        total_completion = sum(u.get("completion_tokens", 0) for u in usages if u)
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages if u)
+
+        def _ws_is_pass(x: TaskOutput) -> bool:
+            if not x or not isinstance(x.result, dict):
+                return False
+            r = x.result.get("reward")
+            try:
+                return r is not None and float(r) >= 1.0
+            except Exception:
+                return False
+
+        overall = {
+            "total": total,
+            "completed": completed,
+            "completed_rate": completed / total if total else 0,
+            "success_at_1": success_at_1,
+            "success_at_1_rate": success_at_1 / total if total else 0,
+            "average_reward": avg,
+        }
+        if trials > 1:
+            overall.update(_compute_trial_metrics(results, _ws_is_pass, trials))
         return {
-            "overall": {
-                "total": total,
-                "completed": completed,
-                "completed_rate": completed / total if total else 0,
-                "success_at_1": success_at_1,
-                "success_at_1_rate": success_at_1 / total if total else 0,
-                "average_reward": avg,
-            }
+            "overall": overall,
+            "token_usage": {
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_tokens,
+                "avg_prompt_tokens_per_episode": round(total_prompt / n_ep),
+                "avg_completion_tokens_per_episode": round(total_completion / n_ep),
+                "avg_total_tokens_per_episode": round(total_tokens / n_ep),
+            },
         }
     if task_name.startswith("dbbench"):
         rel = [x.result for x in results if x and isinstance(x.result, dict)]
@@ -113,13 +179,25 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
         total_prompt = sum(u.get("prompt_tokens", 0) for u in usages if u)
         total_completion = sum(u.get("completion_tokens", 0) for u in usages if u)
         total_tokens = sum(u.get("total_tokens", 0) for u in usages if u)
+
+        def _db_is_pass(x: TaskOutput) -> bool:
+            if not x or not isinstance(x.result, dict):
+                return False
+            try:
+                return float(x.result.get("reward", 0)) >= 1.0
+            except Exception:
+                return False
+
+        overall = {
+            "total": total,
+            "correct": passed,
+            "wrong": total - passed,
+            "acc": passed / total if total else 0,
+        }
+        if trials > 1:
+            overall.update(_compute_trial_metrics(results, _db_is_pass, trials))
         return {
-            "overall": {
-                "total": total,
-                "correct": passed,
-                "wrong": total - passed,
-                "acc": passed / total if total else 0,
-            },
+            "overall": overall,
             "token_usage": {
                 "total_prompt_tokens": total_prompt,
                 "total_completion_tokens": total_completion,
@@ -162,13 +240,16 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
         total_prompt = sum(u.get("prompt_tokens", 0) for u in usages)
         total_completion = sum(u.get("completion_tokens", 0) for u in usages)
         total_tokens = sum(u.get("total_tokens", 0) for u in usages)
+        overall = {
+            "total": total,
+            "pass": passed,
+            "wrong": wrong,
+            "acc": passed / total if total else 0,
+        }
+        if trials > 1:
+            overall.update(_compute_trial_metrics(results, is_pass, trials))
         return {
-            "overall": {
-                "total": total,
-                "pass": passed,
-                "wrong": wrong,
-                "acc": passed / total if total else 0,
-            },
+            "overall": overall,
             "token_usage": {
                 "total_prompt_tokens": total_prompt,
                 "total_completion_tokens": total_completion,
@@ -358,10 +439,13 @@ class TaskClient:
                 hist.append(ChatHistoryItem(role=mapped, content="\n".join(chunks)))
             return hist
 
+        # When running multiple trials, index is [base_idx, trial]. Strip the trial
+        # dimension before sending to the controller which only accepts int/str.
+        task_index = index[0] if isinstance(index, list) and len(index) == 2 else index
         try:
             start_resp = requests.post(
                 self.controller_address + "/start_sample",
-                json=StartSampleRequest(name=self.name, index=index).dict(),
+                json=StartSampleRequest(name=self.name, index=task_index).dict(),
             )
         except Exception as e:
             return TaskClientOutput(error=TaskError.NETWORK_ERROR.value, info=str(e))
@@ -515,7 +599,7 @@ class TaskClient:
             )
         return TaskClientOutput(output=latest_output)
 
-    def calculate_overall(self, results: List[TaskOutput]) -> JSONSerializable:
+    def calculate_overall(self, results: List[TaskOutput], trials: int = 1) -> JSONSerializable:
         statistics = {s: 0 for s in SampleStatus}
         for result in results:
             statistics[SampleStatus(result.status)] += 1
@@ -534,7 +618,7 @@ class TaskClient:
             "total": len(results),
             "validation": statistics,
         }
-        local = _local_calculate_overall(self.name, results)
+        local = _local_calculate_overall(self.name, results, trials=trials)
         slim_results = _slim_outputs_for_worker_aggregate(results)
         payload = CalculateOverallRequest(name=self.name, results=slim_results).dict()
         res = requests.post(

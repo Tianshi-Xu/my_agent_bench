@@ -91,7 +91,14 @@ class Assigner:
             if task not in self.tasks:
                 print(ColorMessage.green(f"creating {task} client..."))
                 self.tasks[task] = self.config.definition.task[task].create()
-                self.task_indices[task] = self.tasks[task].get_indices()
+                base_indices = self.tasks[task].get_indices()
+                trials = getattr(self.config, "trials", 1)
+                if trials > 1:
+                    self.task_indices[task] = [
+                        [idx, t] for idx in base_indices for t in range(trials)
+                    ]
+                else:
+                    self.task_indices[task] = base_indices
             self.remaining_tasks[agent][task] = self.task_indices[task].copy()
             if not os.path.exists(runs_file):
                 continue
@@ -115,6 +122,10 @@ class Assigner:
                                 f"Warning: {agent}/{task}#{index} is finished, but not in the index list."
                             )
                         )
+
+        trials = getattr(self.config, "trials", 1)
+        if trials > 1:
+            print(ColorMessage.cyan(f"Message: trials={trials} (each question runs {trials} times; avg@k / pass@k / pass^2..^{trials} will be computed)"))
 
         count = sum(
             [
@@ -304,7 +315,8 @@ class Assigner:
         def calculate_overall_worker():
             nonlocal agent, task, index, result
             task_client = self.tasks[task]
-            overall = task_client.calculate_overall(self.completions[agent][task])
+            trials = getattr(self.config, "trials", 1)
+            overall = task_client.calculate_overall(self.completions[agent][task], trials=trials)
             with open(
                 os.path.join(self.get_output_dir(agent, task), "overall.json"), "w"
             ) as f:

@@ -4,7 +4,7 @@ from typing import List, Dict, Union, Any, Literal
 from pydantic import BaseModel, validator
 
 JSONSerializable = Union[None, bool, int, float, str, List[Any], Dict[str, Any]]
-SampleIndex = Union[int, str]
+SampleIndex = Union[int, str, List[Any]]
 
 
 class InstanceFactory(BaseModel):

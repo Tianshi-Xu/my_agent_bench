@@ -14,3 +14,4 @@ assignments:
       - dbbench-env_train
 
 output: "outputs/dbbench/{TIMESTAMP}"
+trials: 5

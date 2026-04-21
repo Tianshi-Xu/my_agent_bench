@@ -397,6 +397,11 @@ class WebShop(Task):
         completed = len([x for x in results if x and x.status == SampleStatus.COMPLETED])
         success_at_1 = len([r for r in rewards if float(r) >= 1.0])
         average_reward = sum(rewards) / len(rewards) if rewards else 0
+        usages = [x.get("token_usage", {}) for x in result_payloads]
+        n_ep = len(usages) or 1
+        total_prompt = sum(u.get("prompt_tokens", 0) for u in usages if u)
+        total_completion = sum(u.get("completion_tokens", 0) for u in usages if u)
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages if u)
         return {
             "overall": {
                 "total": total,
@@ -405,5 +410,13 @@ class WebShop(Task):
                 "success_at_1": success_at_1,
                 "success_at_1_rate": success_at_1 / total if total else 0,
                 "average_reward": average_reward,
-            }
+            },
+            "token_usage": {
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_tokens,
+                "avg_prompt_tokens_per_episode": round(total_prompt / n_ep),
+                "avg_completion_tokens_per_episode": round(total_completion / n_ep),
+                "avg_total_tokens_per_episode": round(total_tokens / n_ep),
+            },
         }

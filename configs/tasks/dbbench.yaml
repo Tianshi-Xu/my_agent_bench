@@ -60,6 +60,9 @@ dbbench-std:
   parameters:
     name: dbbench-std
     data_file: "data/dbbench/standard.jsonl"
+    harness:
+      enabled: true
+      h5_top_k: 3
 
 dbbench-env_train:
   parameters:

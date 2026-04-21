@@ -74,6 +74,12 @@ os-std:
   module: "src.server.tasks.os_interaction.OSInteraction"
   parameters:
     name: "os-std"
+    enabled: true
+    h2: true
+    h3: true
+    h4: true
+    h5: true
+    h5_top_k: 2
     data_config:
       files:
         - problem_file: data/os_interaction/data/1/*.json
@@ -105,9 +111,9 @@ os-env_train:
   parameters:
     name: "os-env_train"
     shuffle_seed: 42
-    sample_size: 100
+    sample_size: 20
     # Enable harness for training-split iteration (test split stays untouched)
-    enabled: true
+    enabled: false
     h2: true
     h3: true
     h4: true

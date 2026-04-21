@@ -110,7 +110,7 @@ services:
       - controller
       - freebase
 
-  os_interaction-std:
+  os-std:
     build:
       context: ..
       dockerfile: src/server/tasks/os_interaction/Dockerfile
@@ -128,7 +128,7 @@ services:
     depends_on:
       - controller
 
-  os_interaction-env_train:
+  os-env_train:
     build:
       context: ..
       dockerfile: src/server/tasks/os_interaction/Dockerfile
