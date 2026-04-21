@@ -172,6 +172,7 @@ class HTTPAgent(AgentClient):
         headers=None,
         return_format="{response}",
         prompter=None,
+        timeout=120,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -180,6 +181,7 @@ class HTTPAgent(AgentClient):
         self.headers = headers or {}
         self.body = body or {}
         self.return_format = return_format
+        self.timeout = int(timeout)
         self.prompter = Prompter.get_prompter(prompter)
         if not self.url:
             raise Exception("Please set 'url' parameter")
@@ -194,7 +196,7 @@ class HTTPAgent(AgentClient):
                 body.update(self._handle_history(history))
                 with no_ssl_verification():
                     resp = requests.post(
-                        self.url, json=body, headers=self.headers, proxies=self.proxies, timeout=120
+                        self.url, json=body, headers=self.headers, proxies=self.proxies, timeout=self.timeout
                     )
                 # print(resp.status_code, resp.text)
                 if resp.status_code != 200:
@@ -231,7 +233,7 @@ class HTTPAgent(AgentClient):
                     body["tools"] = tools
                 with no_ssl_verification():
                     resp = requests.post(
-                        self.url, json=body, headers=self.headers, proxies=self.proxies, timeout=120
+                        self.url, json=body, headers=self.headers, proxies=self.proxies, timeout=self.timeout
                     )
                 if resp.status_code != 200:
                     if check_context_limit(resp.text):

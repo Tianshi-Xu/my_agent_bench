@@ -16,7 +16,7 @@ from tqdm import tqdm
 from src.client.task import TaskError
 from .client import TaskClient, AgentClient
 from .configs import ConfigLoader
-from .typings import AssignmentConfig, SampleIndex, TaskOutput, TaskClientOutput
+from .typings import AssignmentConfig, SampleIndex, TaskOutput, TaskClientOutput, SampleStatus
 from .utils import ColorMessage
 from .utils import Graph, MaxFlow
 from time import sleep
@@ -371,7 +371,14 @@ class Assigner:
         if result.error is not None:
             print(ColorMessage.yellow(f"Warning: {agent}/{task}#{index} "
                                       f"failed with error {result.error} {result.info} {result.output}"))
-            if self.auto_retry:
+            # INTERACT_FAILED / session-not-found is a transient infrastructure
+            # failure (controller session timeout, MySQL startup delay, etc.).
+            # Always retry once, regardless of the --auto-retry flag.
+            _is_transient = result.error in (
+                TaskError.INTERACT_FAILED.value,
+                TaskError.NETWORK_ERROR.value,
+            )
+            if self.auto_retry or _is_transient:
                 with self.assignment_lock:
                     self.remaining_tasks[agent][task].insert(0, index)
 
@@ -402,7 +409,13 @@ class Assigner:
             target_file = os.path.join(output_folder, "error.jsonl")
             # For terminal failures (no auto-retry), still record completion so
             # overall.json can be generated with mixed success/failure results.
-            if not self.auto_retry:
+            # Exception: transient errors (INTERACT_FAILED, NETWORK_ERROR) are
+            # always retried so we never record them as terminal here.
+            _is_transient = result.error in (
+                TaskError.INTERACT_FAILED.value,
+                TaskError.NETWORK_ERROR.value,
+            )
+            if not self.auto_retry and not _is_transient:
                 terminal_output = _build_terminal_output_for_failure()
                 self.record_completion(agent, task, index, terminal_output)
                 self.overall_tqdm.update(1)

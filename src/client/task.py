@@ -103,6 +103,81 @@ def _local_calculate_overall(task_name: str, results: List[TaskOutput]) -> dict:
                 "average_reward": avg,
             }
         }
+    if task_name.startswith("dbbench"):
+        rel = [x.result for x in results if x and isinstance(x.result, dict)]
+        rewards = [float(x.get("reward", 0)) for x in rel]
+        total = len(results)
+        passed = sum(1 for r in rewards if r >= 1.0)
+        usages = [x.get("token_usage", {}) for x in rel]
+        n_ep = len(usages) or 1
+        total_prompt = sum(u.get("prompt_tokens", 0) for u in usages if u)
+        total_completion = sum(u.get("completion_tokens", 0) for u in usages if u)
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages if u)
+        return {
+            "overall": {
+                "total": total,
+                "correct": passed,
+                "wrong": total - passed,
+                "acc": passed / total if total else 0,
+            },
+            "token_usage": {
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_tokens,
+                "avg_prompt_tokens_per_episode": round(total_prompt / n_ep),
+                "avg_completion_tokens_per_episode": round(total_completion / n_ep),
+                "avg_total_tokens_per_episode": round(total_tokens / n_ep),
+            },
+        }
+    if task_name.startswith("os-"):
+        def is_pass(x: TaskOutput) -> bool:
+            if not x or not isinstance(x.result, dict):
+                return False
+            if "result" in x.result:
+                return int(x.result.get("result", 0) == 1) == 1
+            reward = x.result.get("reward", None)
+            if reward is not None:
+                try:
+                    return float(reward) >= 1.0
+                except Exception:
+                    return False
+            metrics = x.result.get("metrics", {})
+            score = metrics.get("score", None) if isinstance(metrics, dict) else None
+            if score is not None:
+                try:
+                    return float(score) >= 1.0
+                except Exception:
+                    return False
+            return False
+
+        total = sum(1 for x in results if x)
+        passed = sum(1 for x in results if is_pass(x))
+        wrong = total - passed
+        usages = [
+            x.result.get("token_usage", {})
+            for x in results
+            if x and isinstance(x.result, dict)
+        ]
+        n_ep = len(usages) or 1
+        total_prompt = sum(u.get("prompt_tokens", 0) for u in usages)
+        total_completion = sum(u.get("completion_tokens", 0) for u in usages)
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages)
+        return {
+            "overall": {
+                "total": total,
+                "pass": passed,
+                "wrong": wrong,
+                "acc": passed / total if total else 0,
+            },
+            "token_usage": {
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_tokens,
+                "avg_prompt_tokens_per_episode": round(total_prompt / n_ep),
+                "avg_completion_tokens_per_episode": round(total_completion / n_ep),
+                "avg_total_tokens_per_episode": round(total_tokens / n_ep),
+            },
+        }
     return {
         "note": f"No built-in local aggregate for task {task_name!r}; use worker or extend _local_calculate_overall."
     }
@@ -175,6 +250,11 @@ class TaskClient:
             # Legacy format: {"output": {...}}
             if "output" in payload and isinstance(payload["output"], dict):
                 return TaskOutput.parse_obj(payload["output"])
+            # Some controller/worker versions return TaskOutput directly.
+            # If history is already present, preserve it instead of re-parsing
+            # as OpenAI-style protocol payload.
+            if "history" in payload:
+                return TaskOutput.parse_obj(payload)
             # New format: {"status", "messages", "finish", "reward", "metrics"}
             messages = []
             for item in payload.get("messages", []) or []:
@@ -221,6 +301,31 @@ class TaskClient:
                     }
                 )
             return normalized
+
+        def _seed_openai_messages(output: Optional[TaskOutput]) -> List[dict]:
+            """
+            Build OpenAI-compatible messages from task output history as fallback.
+            This avoids sending empty message arrays to agent LLM endpoints.
+            """
+            if output is None or not output.history:
+                return []
+            seeded: List[dict] = []
+            for item in output.history:
+                role = getattr(item, "role", None)
+                if role is None and isinstance(item, dict):
+                    role = item.get("role")
+                content = getattr(item, "content", None)
+                if content is None and isinstance(item, dict):
+                    content = item.get("content")
+                if not content:
+                    continue
+                if role in ("assistant", "agent"):
+                    seeded.append({"role": "assistant", "content": content})
+                elif role == "system":
+                    seeded.append({"role": "system", "content": content})
+                else:
+                    seeded.append({"role": "user", "content": content})
+            return seeded
 
         def _build_interact_payload(content: str, use_header_sid: bool, sid):
             # New controller expects OpenAI-like messages and session_id in request header.
@@ -278,13 +383,28 @@ class TaskClient:
         # No session_id in payload usually means new controller protocol.
         use_header_sid = "session_id" not in start_payload
         latest_output = _normalize_output(start_payload)
-        api_messages = copy.deepcopy(start_payload.get("messages", []))
+        api_messages = copy.deepcopy(
+            start_payload.get("messages") or _seed_openai_messages(latest_output)
+        )
         api_tools = start_payload.get("tools")
         # Accumulate LLM token usage across all turns in this episode.
         _ep_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         while SampleStatus(latest_output.status) == SampleStatus.RUNNING:
             if use_header_sid and hasattr(agent, "inference_openai"):
+                if not api_messages:
+                    api_messages = _seed_openai_messages(latest_output)
+                if not api_messages:
+                    requests.post(
+                        self.controller_address + "/cancel",
+                        json={},
+                        headers={"session_id": str(sid)},
+                    )
+                    return TaskClientOutput(
+                        error=TaskError.INTERACT_FAILED.value,
+                        info="No messages available for inference_openai; refusing to send empty message list.",
+                        output=latest_output,
+                    )
                 try:
                     assistant_msg, _turn_usage = agent.inference_openai(api_messages, api_tools)
                     for _k in ("prompt_tokens", "completion_tokens", "total_tokens"):

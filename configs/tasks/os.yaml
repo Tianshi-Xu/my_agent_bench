@@ -3,6 +3,15 @@ default:
   parameters:
     concurrency: 32
     round_limit: 8
+    # ─── Harness config (OS) ────────────────────────────────────────────────
+    # Disabled by default; enable per-profile (see os-env_train below).
+    enabled: false
+    h2: true   # rescue text-embedded tool calls (JSON/kwarg/positional/bare/XML) + safety + duplicate-bash gate
+    h3: true   # static shell-strategy / tool-format hints
+    h4: true   # post-step monitor: truncation / errors / empty / loop + budget warn/force
+    h5: true   # BM25 skill library (27 skills) + per-step guidance
+    # h6 / h7 removed: budget absorbed into h4; normalisation is always-on
+    h5_top_k: 2
     tools:
       - type: "function"
         function:
@@ -95,6 +104,15 @@ os-std:
 os-env_train:
   parameters:
     name: "os-env_train"
+    shuffle_seed: 42
+    sample_size: 100
+    # Enable harness for training-split iteration (test split stays untouched)
+    enabled: true
+    h2: true
+    h3: true
+    h4: true
+    h5: true
+    h5_top_k: 2
     data_config:
       files:
         - problem_file: data/os_interaction/train_0317/training.json

@@ -171,9 +171,11 @@ class DBResultProcessor:
                         if len(item) == 1:
                             value = str(item[0]).strip().strip("'\"")
                             cleaned_values.append(value)
-                        # 也可以添加对多值元组的处理逻辑，但根据您的需求似乎只需要处理单值元组
-                    
-                    return cleaned_values
+
+                    # Only return for single-col results. For multi-col tuples return None
+                    # so the caller falls through to the generic string parser, which
+                    # converts each tuple to its repr-string — matching what the agent submits.
+                    return cleaned_values if cleaned_values else None
             except:
                 # 如果 eval 失败，继续尝试原来的方法
                 pass

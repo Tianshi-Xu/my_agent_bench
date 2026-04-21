@@ -32,4 +32,4 @@ qwen3-4b-instruct:
             Authorization: "Bearer EMPTY"
         body:
             model: "openai/Qwen/Qwen3-4B-Instruct"
-            max_tokens: 65536
+            max_tokens: 16384

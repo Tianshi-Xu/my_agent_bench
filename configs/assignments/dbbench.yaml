@@ -1,0 +1,16 @@
+import: definition.yaml
+
+concurrency:
+  task:
+    dbbench-env_train: 16
+    dbbench-std: 16
+  agent:
+    qwen3-4b-instruct: 16
+
+assignments:
+  - agent:
+      - qwen3-4b-instruct
+    task:
+      - dbbench-env_train
+
+output: "outputs/dbbench/{TIMESTAMP}"

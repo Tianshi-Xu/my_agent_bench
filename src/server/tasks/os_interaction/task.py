@@ -5,6 +5,7 @@ import glob
 import json
 import logging
 import os
+import random
 import re
 import traceback
 import weakref
@@ -21,6 +22,13 @@ from agentrl.worker.typings import (AgentCancelledException,
 from openai.types.chat import (ChatCompletionSystemMessageParam,
                                ChatCompletionToolMessageParam,
                                ChatCompletionUserMessageParam)
+
+from src.server.harness import (
+    OSHarnessConfig,
+    OSHarnessRuntime,
+    patch_os_tool_descriptions,
+    rescue_tool_call_from_text,
+)
 
 from .environment import OSEnvironmentDelegation
 
@@ -152,13 +160,38 @@ class OSInteraction(Task):
                  tools=None,
                  env_driver: str = 'docker',
                  env_options: Optional[dict] = None,
+                 shuffle_seed=None,
+                 sample_size=None,
                  **kwargs):
+        # Harness config — pop before super init
+        enabled = kwargs.pop("enabled", False)
+        h2 = kwargs.pop("h2", True)
+        h3 = kwargs.pop("h3", True)
+        h4 = kwargs.pop("h4", True)
+        h5 = kwargs.pop("h5", True)
+        kwargs.pop("h6", None)   # absorbed into h4; ignored
+        kwargs.pop("h7", None)   # always-on normalisation; ignored
+        h5_top_k = kwargs.pop("h5_top_k", 2)
+        self.harness_config = OSHarnessConfig(
+            enabled=bool(enabled),
+            h2_enabled=bool(h2),
+            h3_enabled=bool(h3),
+            h4_enabled=bool(h4),
+            h5_enabled=bool(h5),
+            h5_top_k=int(h5_top_k),
+        )
+        # H3 tool description patching (apply once at class init)
+        if self.harness_config.enabled and self.harness_config.h3_enabled:
+            tools = patch_os_tool_descriptions(tools)
+
         super().__init__(**kwargs)
         self.round_limit: int = round_limit
         self.data_config = data_config
         self.docker_config = docker_config
         self.tools = tools
         self.full_async = True
+        self.shuffle_seed = shuffle_seed
+        self.sample_size = sample_size
         self.problem_configs: Dict[str, Dict[str, Any]] = {}  # {index: CONFIG}
 
         matches = []
@@ -198,6 +231,16 @@ class OSInteraction(Task):
         self.env_delegation = OSEnvironmentDelegation(self.docker_config['localhost'])
         self.env_controller = create_controller(env_driver, self.env_delegation, **env_options)
         self.env_controller_background_task = None
+
+        # Monkey-patch: aiodocker 0.26+ _resolve_long_running_timeout expects
+        # float, not int. agentrl-worker passes int timeout=30 which falls
+        # through to the else branch and crashes.
+        _orig_exec_cmd = self.env_controller.execute_command
+
+        async def _patched_execute_command(environment_id, command, timeout=30):
+            return await _orig_exec_cmd(environment_id, command, timeout=float(timeout))
+
+        self.env_controller.execute_command = _patched_execute_command
 
     def _load_configs(self, config_path, script_root_dir=".") -> List[JudgeConfig]:
         def load_script(script_obj):
@@ -284,24 +327,45 @@ class OSInteraction(Task):
         return configs
 
     def calculate_overall(self, results: List[TaskOutput]) -> Dict[str, Any]:
+        def is_pass(config: TaskOutput) -> bool:
+            if not config or not isinstance(config.result, dict):
+                return False
+            if "result" in config.result:
+                return int(config.result.get("result", 0) == 1) == 1
+            reward = config.result.get("reward", None)
+            if reward is not None:
+                try:
+                    return float(reward) >= 1.0
+                except Exception:
+                    return False
+            metrics = config.result.get("metrics", {})
+            score = metrics.get("score", None) if isinstance(metrics, dict) else None
+            if score is not None:
+                try:
+                    return float(score) >= 1.0
+                except Exception:
+                    return False
+            return False
+
+        total = sum(1 for config in results if config)
+        passed = sum(1 for config in results if is_pass(config))
         overall = {
-            "total": len([config for config in results if config]),
-            "pass": len(
-                [
-                    config
-                    for config in results
-                    if (config and config.result and config.result.get("result", False))
-                ]
-            ),
+            "total": total,
+            "pass": passed,
+            "wrong": total - passed,
+            "acc": passed / total if total else 0,
         }
-        overall["wrong"] = overall["total"] - overall["pass"]
-        overall["acc"] = overall["pass"] / overall["total"] if overall["total"] else 0
         return {
             "overall": overall,
         }
 
     def get_indices(self) -> List[Any]:
-        return list(self.problem_configs.keys())
+        indices = list(self.problem_configs.keys())
+        if self.shuffle_seed is not None:
+            random.Random(self.shuffle_seed).shuffle(indices)
+        if self.sample_size is not None:
+            indices = indices[:self.sample_size]
+        return indices
 
     @staticmethod
     def _extract_action(raw: str):
@@ -396,6 +460,25 @@ class OSInteraction(Task):
             except Exception as e:
                 logging.error(f"Error during container cleanup: {str(e)}")
 
+    @staticmethod
+    def _persist_harness_trace(session: Session, harness_trace: Dict[str, List[Any]]) -> None:
+        """Persist harness_trace via a tagged user message.
+
+        agentrl's HTTP layer strips TaskSampleExecutionResult.result before it
+        reaches the client (runs.jsonl only has reward/metrics/openai_messages/
+        token_usage — verified for os/alfworld/webshop), so trace data is
+        invisible unless we put it where openai_messages gets preserved.  This
+        message is injected AFTER the agent loop exits so the model never
+        sees it; analysis scripts can regex the tag from openai_messages.
+        """
+        try:
+            session.inject(ChatCompletionUserMessageParam(
+                role='user',
+                content='[HARNESS_TRACE_V1]\n' + json.dumps(harness_trace, ensure_ascii=False),
+            ))
+        except Exception as _e:
+            logging.warning(f"Failed to inject harness_trace audit message: {_e}")
+
     async def _judge(
             self, session: Session, config: JudgeConfig, container: Container
     ) -> TaskSampleExecutionResult:
@@ -407,8 +490,29 @@ class OSInteraction(Task):
         if setup_result:
             return setup_result
 
-        # 注入初始消息
+        # 初始化 harness runtime（per-sample）
+        harness_runtime: Optional[OSHarnessRuntime] = None
+        harness_trace: Dict[str, List[Any]] = {
+            "h2": [], "h3": [], "h4": [], "h5": [], "h6": [], "h7": [],
+        }
+        if self.harness_config.enabled:
+            harness_runtime = OSHarnessRuntime(self.harness_config)
+            harness_runtime.init_task(config.description)
+            if self.harness_config.h3_enabled:
+                harness_trace["h3"].append({"applied": True})
+
+        # 注入初始消息 + H5 cold-start
         self._inject_initial_messages(session, config.description)
+        if harness_runtime and self.harness_config.h5_enabled:
+            cold_skills = harness_runtime.cold_start_skill_hints()
+            if cold_skills:
+                skill_lines = [f"- {item['text']}" for item in cold_skills]
+                session.inject(ChatCompletionUserMessageParam(
+                    role='user',
+                    content="Harness skill hints for this task:\n" + "\n".join(skill_lines),
+                ))
+            for item in cold_skills:
+                harness_trace["h5"].append(item)
 
         # 初始化状态变量
         finish = False
@@ -419,10 +523,13 @@ class OSInteraction(Task):
         for round_num in range(self.round_limit):
             logging.info(f"Starting round {round_num + 1}/{self.round_limit}")
             round_reward = 0
+            # H6 budget logic now runs in post_step_monitor after each bash;
+            # no separate budget_check call at round-top.
 
             # 处理Agent行动
             action_result = await self._handle_agent_action(
-                session, container, round_num, finish, round_reward, function_name, call_id
+                session, container, round_num, finish, round_reward, function_name, call_id,
+                harness_runtime=harness_runtime, harness_trace=harness_trace,
             )
 
             # 更新状态
@@ -446,16 +553,22 @@ class OSInteraction(Task):
             final_rewardhistory = RewardHistoryItem(reward=0, score=0)
             session.inject(final_rewardhistory)
 
+            # Persist harness_trace via openai_messages (agentrl strips result dict)
+            self._persist_harness_trace(session, harness_trace)
+
             return TaskSampleExecutionResult(
                 status=SampleStatus.TASK_LIMIT_REACHED,
-                result={"result": False, "reason": "round limit"},
+                result={"result": False, "reason": "round limit", "harness_trace": harness_trace},
             )
 
-        # 评估答案
-        evaluation_result = await self._evaluate_answer(answer, config, container, session)
+        # 评估答案（含 H7 归一化）
+        evaluation_result = await self._evaluate_answer(
+            answer, config, container, session, harness_runtime=harness_runtime, harness_trace=harness_trace,
+        )
 
         # 如果发生评估错误
         if evaluation_result.get("error"):
+            self._persist_harness_trace(session, harness_trace)
             return evaluation_result.get("result")
 
         # 设置最终奖励
@@ -469,8 +582,11 @@ class OSInteraction(Task):
         final_rewardhistory = RewardHistoryItem(reward=final_reward, score=os_score)
         session.inject(final_rewardhistory)
 
+        # Persist harness_trace via openai_messages (agentrl strips result dict)
+        self._persist_harness_trace(session, harness_trace)
+
         return TaskSampleExecutionResult(
-            status=SampleStatus.COMPLETED, result={"result": jd}
+            status=SampleStatus.COMPLETED, result={"result": jd, "harness_trace": harness_trace}
         )
 
     async def _setup_execution_environment(
@@ -534,7 +650,9 @@ Always use a tool provided instead of simply responding with content."""
 
     async def _handle_agent_action(
             self, session: Session, container: Container, round_num: int,
-            finish: bool, round_reward: float, function_name: Optional[str], call_id: Optional[str]
+            finish: bool, round_reward: float, function_name: Optional[str], call_id: Optional[str],
+            harness_runtime: Optional[OSHarnessRuntime] = None,
+            harness_trace: Optional[Dict[str, List[Any]]] = None,
     ) -> dict:
         # 获取Agent行动
         response = await session.action()
@@ -554,16 +672,114 @@ Always use a tool provided instead of simply responding with content."""
                 response_content = message.get('content')
             tool_calls.extend(message.get('tool_calls', []) or [])
 
+        # H2: Force-action consumption — if a previous H4/H6 set a forced
+        # action, synthesise it here before any other handling so the env
+        # executes the harness-chosen action this turn.
+        forced_tool_call: Optional[Dict[str, Any]] = None
+        if (
+            harness_runtime is not None
+            and self.harness_config.h2_enabled
+            and harness_runtime.force_next_action is not None
+        ):
+            fa = harness_runtime.force_next_action
+            harness_runtime.force_next_action = None
+            forced_tool_call = {
+                "id": f"harness_forced_{round_num}",
+                "type": "function",
+                "function": {
+                    "name": fa["name"],
+                    "arguments": json.dumps(fa.get("arguments", {})),
+                },
+            }
+            if harness_trace is not None:
+                harness_trace["h2"].append({
+                    "round": round_num + 1,
+                    "reason": "force_consumed",
+                    "action_name": fa["name"],
+                })
+
         # 检查是否有有效的工具调用
-        if len(tool_calls) == 0:
-            logging.warning("Empty tool calls array")
-            session.inject(ChatCompletionUserMessageParam(
-                role='user',
-                content="No executable tool calls found. Please call a tool instead"
-            ))
-            round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
-            session.inject(round_rewardhistory)
-            return result
+        if len(tool_calls) == 0 and forced_tool_call is None:
+            # H2 rescue parser: attempt to lift a tool call out of plain text.
+            rescued_tool_call: Optional[Dict[str, Any]] = None
+            _content_has_xml_tool_call = bool(
+                response_content and '<tool_call>' in response_content.lower()
+            )
+            if harness_runtime is not None and self.harness_config.h2_enabled and response_content:
+                rescued = rescue_tool_call_from_text(response_content)
+                if rescued is not None:
+                    # H7 normalization at rescue time: normalize answer value
+                    # immediately so the submitted value is already clean.
+                    if (
+                        rescued["name"] == "answer_action"
+                        and isinstance(rescued.get("arguments", {}).get("answer"), str)
+                    ):
+                        raw_ans = rescued["arguments"]["answer"]
+                        norm_ans, norm_mut = harness_runtime.normalize_answer(raw_ans)
+                        if norm_mut:
+                            rescued["arguments"]["answer"] = norm_ans
+                            if harness_trace is not None:
+                                harness_trace["h7"].append({
+                                    "mutated": True,
+                                    "before": raw_ans,
+                                    "after": norm_ans,
+                                    "trigger": "rescue",
+                                })
+                    rescued_tool_call = {
+                        "id": f"harness_rescued_{round_num}",
+                        "type": "function",
+                        "function": {
+                            "name": rescued["name"],
+                            "arguments": json.dumps(rescued.get("arguments", {})),
+                        },
+                    }
+                    harness_runtime.note_rescue_hit()
+                    if harness_trace is not None:
+                        harness_trace["h2"].append({
+                            "round": round_num + 1,
+                            "reason": "rescued_text_embedded",
+                            "action_name": rescued["name"],
+                        })
+            if rescued_tool_call is None:
+                logging.warning("Empty tool calls array")
+                if harness_runtime is not None:
+                    harness_runtime.note_text_only_turn()
+                # When the model wrote <tool_call> XML but it was truncated/malformed
+                # so rescue failed, give specific feedback to break the loop.
+                if _content_has_xml_tool_call:
+                    nudge = (
+                        "Harness: your <tool_call> XML was truncated or malformed and "
+                        "could not be parsed. Do NOT write tool calls as XML text — "
+                        "use the function calling API directly. Call bash_action or "
+                        "answer_action as a proper function call (not as text)."
+                    )
+                else:
+                    nudge = "No executable tool calls found. Please call a tool instead"
+                    if (
+                        harness_runtime is not None
+                        and self.harness_config.h4_enabled
+                        and harness_runtime.state.text_only_streak >= self.harness_config.h2_text_only_streak_force
+                    ):
+                        nudge += (
+                            " — you MUST invoke a function. Never write `answer_action(...)` "
+                            "or `bash_action(...)` as plain text. If you already have the "
+                            "answer, call answer_action with just the value."
+                        )
+                session.inject(ChatCompletionUserMessageParam(
+                    role='user',
+                    content=nudge,
+                ))
+                round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
+                session.inject(round_rewardhistory)
+                return result
+            tool_calls = [rescued_tool_call]
+
+        # Forced action from harness takes precedence over model output
+        if forced_tool_call is not None:
+            tool_calls = [forced_tool_call]
+
+        if harness_runtime is not None:
+            harness_runtime.reset_text_only_streak()
 
         # 获取第一个工具调用
         tool_call = tool_calls[0]
@@ -625,14 +841,49 @@ Always use a tool provided instead of simply responding with content."""
         action = action_data["action"]
         content = action_data["content"]
 
+        # H2 pre_validate: safety filter + duplicate-bash gate
+        if harness_runtime is not None and self.harness_config.h2_enabled and action == "bash":
+            pv = harness_runtime.pre_validate_action("bash_action", content)
+            if harness_trace is not None:
+                harness_trace["h2"].append({
+                    "round": round_num + 1,
+                    "reason": pv.get("reason", ""),
+                    "blocked": pv.get("blocked", False),
+                    "action_name": "bash_action",
+                })
+            if pv.get("blocked"):
+                block_msg = (
+                    "Harness blocked this command: "
+                    + (pv.get("reason") or "policy_violation")
+                )
+                if pv.get("reason") == "duplicate_bash_force_answer":
+                    block_msg = (
+                        "Harness: you've run the same command repeatedly. "
+                        "Submitting the detected answer via answer_action on the next turn."
+                    )
+                session.inject(ChatCompletionToolMessageParam(
+                    role='tool',
+                    content=block_msg,
+                    tool_call_id=call_id,
+                ))
+                round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
+                session.inject(round_rewardhistory)
+                return result
+
         # 提交答案
         if action == "commit":
             logging.info("Received commit action with answer")
+            if harness_runtime is not None:
+                harness_runtime.note_answer_submitted()
             result["answer"] = content
             result["finish"] = True
         # 执行bash命令
         elif action == "bash":
-            await self._execute_bash_command(session, container, content, call_id)
+            await self._execute_bash_command(
+                session, container, content, call_id,
+                harness_runtime=harness_runtime, harness_trace=harness_trace,
+                round_num=round_num,
+            )
 
         # 注入回合奖励
         round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
@@ -641,7 +892,10 @@ Always use a tool provided instead of simply responding with content."""
         return result
 
     async def _execute_bash_command(
-            self, session: Session, container: Container, command: str, id: str
+            self, session: Session, container: Container, command: str, id: str,
+            harness_runtime: Optional[OSHarnessRuntime] = None,
+            harness_trace: Optional[Dict[str, List[Any]]] = None,
+            round_num: int = 0,
     ) -> None:
         """执行bash命令并处理结果"""
         logging.info("Executing bash command")
@@ -668,8 +922,66 @@ Always use a tool provided instead of simply responding with content."""
             tool_call_id=id
         ))
 
+        # H1: update shell state with latest bash + decoded output
+        if harness_runtime is not None:
+            harness_runtime.update_state_after_bash(command, result_text)
+
+        # H4 + H6 (merged): post-step monitor — inject recovery hint + budget logic
+        h4_audit_active = False
+        if (
+            harness_runtime is not None
+            and self.harness_config.h4_enabled
+        ):
+            remaining = self.round_limit - round_num  # rounds remaining inclusive of this one
+            h4 = harness_runtime.post_step_monitor(remaining_rounds=remaining)
+            audit = h4.get("audit_reason", "")
+            if harness_trace is not None:
+                entry = {
+                    "round": round_num + 1,
+                    "audit_reason": audit,
+                    "recovery_prompt": h4.get("recovery_prompt"),
+                }
+                # Route budget events into h6 trace slot for auditability
+                if audit in ("budget_force", "budget_warn"):
+                    harness_trace["h6"].append(entry)
+                else:
+                    harness_trace["h4"].append(entry)
+            if h4.get("force_action"):
+                harness_runtime.force_next_action = h4["force_action"]
+            if h4.get("recovery_prompt"):
+                h4_audit_active = True
+                session.inject(ChatCompletionUserMessageParam(
+                    role='user',
+                    content=h4["recovery_prompt"],
+                ))
+
+        # H5: per-step goal-directed guidance — pass h4_audit_active so the
+        # submit hint is suppressed when H4 just emitted a recovery message
+        # (prevents conflicting signals: H4 says "retry" while H5 says "submit").
+        if (
+            harness_runtime is not None
+            and self.harness_config.h5_enabled
+        ):
+            hint = harness_runtime.step_guidance(
+                round_num, self.round_limit, h4_audit_active=h4_audit_active
+            )
+            if hint:
+                session.inject(ChatCompletionUserMessageParam(
+                    role='user',
+                    content=hint,
+                ))
+                if harness_trace is not None:
+                    harness_trace["h5"].append({
+                        "round": round_num + 1,
+                        "text": hint,
+                        "trigger": "step_guidance",
+                        "token_cost": str(len(hint.split())),
+                    })
+
     async def _evaluate_answer(
-            self, answer, config: JudgeConfig, container: Container, session: Session
+            self, answer, config: JudgeConfig, container: Container, session: Session,
+            harness_runtime: Optional[OSHarnessRuntime] = None,
+            harness_trace: Optional[Dict[str, List[Any]]] = None,
     ) -> dict:
         """评估答案"""
         result = {"success": False}
@@ -677,6 +989,20 @@ Always use a tool provided instead of simply responding with content."""
         # 处理答案格式
         if isinstance(answer, str) and config.match and config.match["strip"]:
             answer = answer.strip()
+
+        # H7: shape-conditional answer normalisation (always-on)
+        if harness_runtime is not None and isinstance(answer, str):
+            normalized, mutated = harness_runtime.normalize_answer(answer)
+            if harness_trace is not None:
+                harness_trace["h7"].append({
+                    "mutated": mutated,
+                    "before": answer,
+                    "after": normalized,
+                })
+            if mutated:
+                logging.info(f"H7 normalised answer: {answer!r} -> {normalized!r}")
+            answer = normalized
+
         logging.info(f"Final answer: {answer}")
 
         # 使用匹配标准评估

@@ -4,6 +4,20 @@ default:
     concurrency: 32
     max_round: 15
 
+    harness:
+      enabled: false        # set to true in env_train split
+      h2: true              # action gate + SQL rewrite + commit gate + answer normalisation
+      h3: true              # tool/prompt static hints + schema card
+      h4: true              # post-step monitor + budget warn/force
+      h5: true              # skill library + step guidance
+      h5_top_k: 2
+      h2_repeat_sql_block_after: 2
+      h4_stall_window: 3
+      h4_empty_threshold: 2
+      h4_budget_warn_threshold: 3
+      h4_budget_force_threshold: 2
+      h5_hint_max_words: 40
+
     tools:
       - type: "function"
         function:
@@ -52,3 +66,9 @@ dbbench-env_train:
     name: dbbench-env_train
     data_file: "data/dbbench/db_out_new.jsonl"
     db_file: "data/dbbench/db_train"
+    shuffle_seed: 44
+    # Adjust this number to control train-set sampling size.
+    sample_size: 100
+    harness:
+      enabled: true
+      h5_top_k: 3
