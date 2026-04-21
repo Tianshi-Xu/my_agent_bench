@@ -8,7 +8,8 @@ pip install -r requirements.txt
 ## Run
 #### 1.配置
 - 首先需要确认configs文件夹下的三种配置 (以alfworld为例)
-  - agents/api_agents.yaml: 确认url是正确的，sglang服务的启动可以参考taubench的start_sglang.py，注意端口号对齐。
+  - agents/api_agents.yaml: 确认url是正确的，sglang服务的启动需要参考taubench的start_sglang.py，注意端口号对齐。
+    - 补充: sglang环境配置非常简单，用uv管理环境，uv pip install sglang即可，参见：https://docs.sglang.io/get_started/install.html。
   - tasks/alfworld.yaml: alfworld-std和alfworld-env_train分别代表了测试集和训练集，测试的时候只需要跑测试集。`enabled`字段表示是否开启harness，后续的h2/h3等字段表示启动对应层级的harness，做消融实验时，每次只去掉其中一个层级，并保持其他层级打开。
   - assignments/alfworld_train.yaml: 确认assignments是正确的, concurrency可以设置为16。`output`参数表明了结果放到哪个文件夹，可以自由配置整理。
 #### 2.运行
