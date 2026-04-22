@@ -9,16 +9,17 @@ H1       Session State          — per-round SQL history, error tracking,
                                   candidate answer, streaks
 H2       Action Gate            — tool-call rescue + SQL auto-backtick +
                                   MySQL dialect fix + commit gate + answer
-                                  normalization (H7 merged here)
+                                  normalisation (interface-boundary repair)
 H3       Tool-description patch — static hints on execute_sql / commit_final_answer
 H4       Post-step Monitor      — syntax / unknown-col / empty / loop +
-                                  budget warn/force (H6 merged here)
+                                  budget warn/force (runtime monitoring)
 H5       Skill library + step   — BM25-ranked cold-start skills + per-step
                                   guidance (round-0 templates + lint)
 
 Merge policy (per user feedback):
-  - H6 (budget management) merged into H4 — no independent h6 switch.
-  - H7 (answer normalisation) merged into H2 commit gate — no independent h7.
+  - Budget management lives inside H4 (runtime monitoring).
+  - Answer normalisation lives inside H2 commit gate (interface-boundary repair).
+  - Only four top-level switches are exposed: h2 / h3 / h4 / h5.
 
 H4 false-positive avoidance notes (per user warning):
   - Error hints only on specific MySQL error tokens (Unknown column / doesn't
@@ -76,7 +77,7 @@ SHAPE_HASH         = "hash"  # INSERT/UPDATE/DELETE — answer ignored by evalua
 @dataclass
 class DBBenchHarnessConfig:
     enabled: bool = False
-    # Only h2/h3/h4/h5 — H6 merged into H4, H7 merged into H2.
+    # Only h2/h3/h4/h5 — budget management lives in H4, answer normalisation in H2.
     h2_enabled: bool = True
     h3_enabled: bool = True
     h4_enabled: bool = True
@@ -95,8 +96,10 @@ class DBBenchHarnessConfig:
     h4_budget_warn_threshold: int = 3    # remaining <= N → soft warn
     h4_budget_force_threshold: int = 2   # remaining <= N + candidate plausible → force
 
+    # H4-E hint
+    h4_hint_max_words: int = 40
+
     # H5
-    h5_hint_max_words: int = 40
     h5_top_k: int = 2
     h5_cold_start_max_words: int = 50
 
@@ -1133,7 +1136,7 @@ def _is_dangerous_sql(sql: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# H2 — Answer normalization (formerly H7)
+# H2 — Answer normalisation (interface-boundary repair at commit)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ANSWER_UNIT_TOKENS = {
@@ -1733,7 +1736,7 @@ class DBBenchHarnessRuntime:
             response["rule_hits"].append({"rule": "block_scalar_multi_answer"})
             return response
 
-        # Answer normalisation (formerly H7).
+        # H2 answer normalisation (shape-aware).
         normalised, audit = normalize_answers_list(answers, ctx.answer_shape)
 
         # For multi-col SELECT: if the agent submitted flat cells (e.g. ["a","b","c","d"…])
@@ -2079,7 +2082,7 @@ class DBBenchHarnessRuntime:
             )
             return _return(response)
 
-        # ⑥ (formerly H6) Budget management.  Only fires when NO earlier branch did.
+        # ⑥ Budget management (H4 sub-branch).  Only fires when NO earlier branch did.
         rem = remaining_rounds
         budget_force_threshold = self.config.h4_budget_force_threshold
         budget_warn_threshold = self.config.h4_budget_warn_threshold
@@ -2126,14 +2129,15 @@ class DBBenchHarnessRuntime:
         st.h4_fired_last_round = False
         return response
 
-    # ── H5 per-step guidance ────────────────────────────────────────────────
+    # ── H4-E: state-driven per-step guidance ────────────────────────────────
 
     def step_guidance(
         self,
         round_num: int,
         h4_audit_active: bool = False,
     ) -> Optional[str]:
-        if not self.config.h5_enabled or self.task_ctx is None:
+        """H4-E: Per-step guidance driven by H1 runtime state (candidate answers, SQL history)."""
+        if not self.config.h4_enabled or self.task_ctx is None:
             return None
         ctx = self.task_ctx
         st = self.state
@@ -2208,8 +2212,8 @@ class DBBenchHarnessRuntime:
             return None
 
         words = hint.split()
-        if len(words) > self.config.h5_hint_max_words:
-            hint = " ".join(words[: self.config.h5_hint_max_words])
+        if len(words) > self.config.h4_hint_max_words:
+            hint = " ".join(words[: self.config.h4_hint_max_words])
 
         if hint == self._last_hint:
             return None

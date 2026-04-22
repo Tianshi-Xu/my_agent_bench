@@ -1,17 +1,18 @@
 """
-ALFWorld Harness — H0/H2/H3/H4/H5/H6
+ALFWorld Harness — H0/H2/H3/H4/H5
 
 H0  Task Parser        — one-time structured task parsing per episode
 H2  Action Gate        — verb-safe canonicalization + invalid blocking
 H3  Tool Description   — task-type-aware tool hint embedding
-H4  Process Monitor    — world model, subgoal state machine, stall detection
+H4  Process Monitor    — world model, subgoal state machine, stall detection,
+                         step-budget urgency + forced completion (budget sub-branch)
 H5  Goal-directed Hint — cold-start skill + per-step guided suggestions
-H6  Budget Manager     — step-budget urgency injection + forced completion
 
 Generalization notes:
   - _SEARCH_PRIORITY is based on household commonsense, NOT training statistics.
-  - H5 step guidance uses "suggestion" language; hard-forcing only in H6 when
-    world-model evidence is unambiguous (item in hand + put action in admissible).
+  - H5 step guidance uses "suggestion" language; hard-forcing only in the H4
+    budget sub-branch when world-model evidence is unambiguous (item in hand +
+    put action in admissible).
   - All observation/action patterns match the ALFWorld environment API, which is
     identical across train/test splits.
 """
@@ -128,7 +129,6 @@ class ALFWorldHarnessConfig:
     h3_enabled: bool = True
     h4_enabled: bool = True
     h5_enabled: bool = True
-    h6_enabled: bool = True          # new
 
     # H2
     action_similarity_threshold: float = 0.55   # raised from 0.20
@@ -142,7 +142,7 @@ class ALFWorldHarnessConfig:
     h4_stall_window: int = 4
     h4_soft_intervention_rounds: int = 2
     h4_min_rounds_before_stall: int = 8
-    h4_post_put_grace: int = 4       # new: rounds after PUT where stall is suppressed
+    h4_post_put_grace: int = 4
 
     # H5
     h5_top_k: int = 1          # max skills injected at cold-start
@@ -156,10 +156,10 @@ class ALFWorldHarnessConfig:
     # H2 — empty-turn intervention
     h2_empty_turn_threshold: int = 2        # consecutive empty actions before reminder
 
-    # H6
-    h6_warn_threshold: int = 7       # remaining steps < N → inject urgency hint
-    h6_force_threshold: int = 4      # remaining steps < N → force PUT if possible
-    h6_warn_threshold_multistep: int = 12  # higher warn for pick_two_obj / pick_cool
+    # H4 budget
+    h4_budget_warn_threshold: int = 7       # remaining steps < N → inject urgency hint
+    h4_budget_force_threshold: int = 4      # remaining steps < N → force PUT if possible
+    h4_budget_warn_threshold_multistep: int = 12  # higher warn for pick_two_obj / pick_cool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1111,14 +1111,14 @@ class ALFWorldHarnessRuntime:
 
     def step_guidance(self, current_round: int, max_step: int, admissible: List[str]) -> Optional[str]:
         """
-        H5 per-step guidance: generate a specific, actionable hint based on
+        H4-E per-step guidance: generate a specific, actionable hint based on
         current subgoal state and world model.
 
         Returns None when no helpful guidance can be produced (to avoid noise).
         Guidance is always phrased as a suggestion, not a command, to preserve
         agent autonomy and generalisation across scenes.
         """
-        if not self.config.h5_enabled or self.task_ctx is None:
+        if not self.config.h4_enabled or self.task_ctx is None:
             return None
 
         sg = self._current_subgoal()
@@ -1280,11 +1280,11 @@ class ALFWorldHarnessRuntime:
         self._last_step_hint_sg_idx = self._subgoal_idx
         return hint
 
-    # ── H6 ───────────────────────────────────────────────────────────────────
+    # ── H4 budget (sub-branch of post-step monitoring) ────────────────────────
 
     def budget_check(self, remaining_steps: int, admissible: List[str]) -> Dict[str, Any]:
         """
-        H6: Step-budget management.
+        H4-D: Step-budget management (H4 sub-branch).
 
         - Warn when budget is low and we're still searching.
         - Force a PUT action when budget is critical and conditions are unambiguous:
@@ -1292,7 +1292,7 @@ class ALFWorldHarnessRuntime:
           This is the only place where harness forces a non-exploration action.
         """
         response: Dict[str, Any] = {"hint": None, "force_action": None}
-        if not self.config.h6_enabled or self.task_ctx is None:
+        if not self.config.h4_enabled or self.task_ctx is None:
             return response
 
         sg = self._current_subgoal()
@@ -1301,7 +1301,7 @@ class ALFWorldHarnessRuntime:
         tt = self.task_ctx.target_type
 
         # Hard force: agent holds correct item, put action is available, steps critical
-        if remaining_steps < self.config.h6_force_threshold:
+        if remaining_steps < self.config.h4_budget_force_threshold:
             if world.inventory and sg in (_SG_GOTO_DEST, _SG_PUT):
                 put_a = world.find_put_action(dt, admissible)
                 if put_a:
@@ -1314,9 +1314,9 @@ class ALFWorldHarnessRuntime:
         # Soft warn: still searching with few steps left.
         # Multi-step tasks (pick_two_obj: 2 full cycles; pick_cool: extra fridge detour)
         # need more buffer, so their effective warn threshold is raised.
-        warn_threshold = self.config.h6_warn_threshold
+        warn_threshold = self.config.h4_budget_warn_threshold
         if self.task_ctx.task_type in ("pick_two_obj", "pick_cool_then_place"):
-            warn_threshold = max(warn_threshold, self.config.h6_warn_threshold_multistep)
+            warn_threshold = max(warn_threshold, self.config.h4_budget_warn_threshold_multistep)
         if remaining_steps < warn_threshold and sg == _SG_FIND:
             ordered = world.ordered_unvisited(tt)
             top = ordered[:2] if ordered else []
@@ -1412,6 +1412,60 @@ ALF_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "If recent actions revealed no new objects or progress, "
             "switch to a different unexplored location immediately."
+        ),
+    },
+    {
+        "id": "appliance_is_midpoint_not_destination",
+        "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
+        "keywords": ["fridge", "microwave", "sinkbasin", "destination", "deliver", "after", "then"],
+        "text": (
+            "The transformation appliance (fridge/microwave/sinkbasin) is a midpoint, "
+            "not the destination. After transforming the object, pick it up from the appliance "
+            "and carry it to the separate destination receptacle."
+        ),
+    },
+    {
+        "id": "examine_plain_is_useless",
+        "task_types": ["look_at_obj"],
+        "keywords": ["examine", "desklamp", "nothing special", "lamp", "with"],
+        "text": (
+            "Plain 'examine X' says 'nothing special' and does NOT complete the task. "
+            "The only valid action is 'examine X with desklamp' while standing next to "
+            "a lit desklamp. Find the desklamp, turn it on, take the target object, "
+            "then use the exact 'examine X with desklamp' action."
+        ),
+    },
+    {
+        "id": "take_before_visiting_appliance",
+        "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
+        "keywords": ["carry", "hold", "inventory", "pick up", "before", "appliance"],
+        "text": (
+            "You cannot transform an object remotely. You MUST pick up the target object "
+            "first, then carry it in your inventory to the appliance. Visiting the appliance "
+            "without holding the object accomplishes nothing."
+        ),
+    },
+    {
+        "id": "nothing_happens_means_wrong_state",
+        "task_types": [
+            "pick_and_place", "pick_two_obj",
+            "pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place",
+        ],
+        "keywords": ["nothing happens", "wrong", "state", "repeat", "fail", "stuck"],
+        "text": (
+            "'Nothing happens' means the action is invalid for the current state — "
+            "the object may need to be held, transformed first, or the receptacle may "
+            "need to be opened. Do NOT repeat the same action; change your approach."
+        ),
+    },
+    {
+        "id": "two_obj_second_item_different_location",
+        "task_types": ["pick_two_obj"],
+        "keywords": ["second", "another", "two", "different", "source", "destination"],
+        "text": (
+            "After delivering the first object, search for the second in unexplored locations. "
+            "Never pick up an object you just placed at the destination. "
+            "If the destination looks like a source location, confirm the item is a new one."
         ),
     },
 ]

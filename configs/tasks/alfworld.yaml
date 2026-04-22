@@ -2,7 +2,7 @@ default:
   module: src.server.tasks.alfworld.ALFWorld
   parameters:
     name: alfworld-std
-    concurrency: 16
+    concurrency: 32
     data_path: "/app/data/alfworld"
     config_path: "/app/src/server/tasks/alfworld/configs/base_config.yaml"
     prompts_path: "/app/src/server/tasks/alfworld/prompts/alfworld_multiturn_plan_first.json"
@@ -38,7 +38,6 @@ alfworld-std:
     h3: true
     h4: true
     h5: false
-    h6: true
     h5_top_k: 3
 
 alfworld-env_train:
@@ -54,6 +53,5 @@ alfworld-env_train:
     h3: true
     h4: true
     h5: true
-    h6: true
     h5_top_k: 2
 

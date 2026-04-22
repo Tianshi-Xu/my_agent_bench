@@ -10,7 +10,7 @@ default:
       h3: true              # tool/prompt static hints + schema card
       h4: true              # post-step monitor + budget warn/force
       h5: true              # skill library + step guidance
-      h5_top_k: 2
+      h5_top_k: 3
       h2_repeat_sql_block_after: 2
       h4_stall_window: 3
       h4_empty_threshold: 2

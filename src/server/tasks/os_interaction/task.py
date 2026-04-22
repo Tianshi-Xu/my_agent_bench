@@ -169,8 +169,6 @@ class OSInteraction(Task):
         h3 = kwargs.pop("h3", True)
         h4 = kwargs.pop("h4", True)
         h5 = kwargs.pop("h5", True)
-        kwargs.pop("h6", None)   # absorbed into h4; ignored
-        kwargs.pop("h7", None)   # always-on normalisation; ignored
         h5_top_k = kwargs.pop("h5_top_k", 2)
         self.harness_config = OSHarnessConfig(
             enabled=bool(enabled),
@@ -493,7 +491,7 @@ class OSInteraction(Task):
         # 初始化 harness runtime（per-sample）
         harness_runtime: Optional[OSHarnessRuntime] = None
         harness_trace: Dict[str, List[Any]] = {
-            "h2": [], "h3": [], "h4": [], "h5": [], "h6": [], "h7": [],
+            "h2": [], "h3": [], "h4": [], "h5": [],
         }
         if self.harness_config.enabled:
             harness_runtime = OSHarnessRuntime(self.harness_config)
@@ -523,7 +521,7 @@ class OSInteraction(Task):
         for round_num in range(self.round_limit):
             logging.info(f"Starting round {round_num + 1}/{self.round_limit}")
             round_reward = 0
-            # H6 budget logic now runs in post_step_monitor after each bash;
+            # H4 budget logic runs inside post_step_monitor after each bash;
             # no separate budget_check call at round-top.
 
             # 处理Agent行动
@@ -561,7 +559,7 @@ class OSInteraction(Task):
                 result={"result": False, "reason": "round limit", "harness_trace": harness_trace},
             )
 
-        # 评估答案（含 H7 归一化）
+        # 评估答案（H2 answer 归一化作为接口边界修复）
         evaluation_result = await self._evaluate_answer(
             answer, config, container, session, harness_runtime=harness_runtime, harness_trace=harness_trace,
         )
@@ -672,9 +670,9 @@ Always use a tool provided instead of simply responding with content."""
                 response_content = message.get('content')
             tool_calls.extend(message.get('tool_calls', []) or [])
 
-        # H2: Force-action consumption — if a previous H4/H6 set a forced
-        # action, synthesise it here before any other handling so the env
-        # executes the harness-chosen action this turn.
+        # H2: Force-action consumption — if a previous H4 monitor set a
+        # forced action, synthesise it here before any other handling so the
+        # env executes the harness-chosen action this turn.
         forced_tool_call: Optional[Dict[str, Any]] = None
         if (
             harness_runtime is not None
@@ -708,8 +706,8 @@ Always use a tool provided instead of simply responding with content."""
             if harness_runtime is not None and self.harness_config.h2_enabled and response_content:
                 rescued = rescue_tool_call_from_text(response_content)
                 if rescued is not None:
-                    # H7 normalization at rescue time: normalize answer value
-                    # immediately so the submitted value is already clean.
+                    # H2 rescue-time answer normalisation: normalise answer
+                    # value immediately so the submitted value is already clean.
                     if (
                         rescued["name"] == "answer_action"
                         and isinstance(rescued.get("arguments", {}).get("answer"), str)
@@ -719,7 +717,8 @@ Always use a tool provided instead of simply responding with content."""
                         if norm_mut:
                             rescued["arguments"]["answer"] = norm_ans
                             if harness_trace is not None:
-                                harness_trace["h7"].append({
+                                harness_trace["h2"].append({
+                                    "sub": "answer_normalise",
                                     "mutated": True,
                                     "before": raw_ans,
                                     "after": norm_ans,
@@ -926,7 +925,7 @@ Always use a tool provided instead of simply responding with content."""
         if harness_runtime is not None:
             harness_runtime.update_state_after_bash(command, result_text)
 
-        # H4 + H6 (merged): post-step monitor — inject recovery hint + budget logic
+        # H4 post-step monitor — recovery hint + budget warn/force + stall checks
         h4_audit_active = False
         if (
             harness_runtime is not None
@@ -941,11 +940,9 @@ Always use a tool provided instead of simply responding with content."""
                     "audit_reason": audit,
                     "recovery_prompt": h4.get("recovery_prompt"),
                 }
-                # Route budget events into h6 trace slot for auditability
                 if audit in ("budget_force", "budget_warn"):
-                    harness_trace["h6"].append(entry)
-                else:
-                    harness_trace["h4"].append(entry)
+                    entry["sub"] = "budget"
+                harness_trace["h4"].append(entry)
             if h4.get("force_action"):
                 harness_runtime.force_next_action = h4["force_action"]
             if h4.get("recovery_prompt"):
@@ -955,12 +952,12 @@ Always use a tool provided instead of simply responding with content."""
                     content=h4["recovery_prompt"],
                 ))
 
-        # H5: per-step goal-directed guidance — pass h4_audit_active so the
+        # H4-E: state-driven per-step guidance — pass h4_audit_active so the
         # submit hint is suppressed when H4 just emitted a recovery message
-        # (prevents conflicting signals: H4 says "retry" while H5 says "submit").
+        # (prevents conflicting signals: H4 says "retry" while H4-E says "submit").
         if (
             harness_runtime is not None
-            and self.harness_config.h5_enabled
+            and self.harness_config.h4_enabled
         ):
             hint = harness_runtime.step_guidance(
                 round_num, self.round_limit, h4_audit_active=h4_audit_active
@@ -971,8 +968,9 @@ Always use a tool provided instead of simply responding with content."""
                     content=hint,
                 ))
                 if harness_trace is not None:
-                    harness_trace["h5"].append({
+                    harness_trace["h4"].append({
                         "round": round_num + 1,
+                        "sub": "h4e_step_guidance",
                         "text": hint,
                         "trigger": "step_guidance",
                         "token_cost": str(len(hint.split())),
@@ -990,17 +988,23 @@ Always use a tool provided instead of simply responding with content."""
         if isinstance(answer, str) and config.match and config.match["strip"]:
             answer = answer.strip()
 
-        # H7: shape-conditional answer normalisation (always-on)
-        if harness_runtime is not None and isinstance(answer, str):
+        # H2: shape-conditional answer normalisation at commit (interface-boundary repair)
+        if (
+            harness_runtime is not None
+            and self.harness_config.h2_enabled
+            and isinstance(answer, str)
+        ):
             normalized, mutated = harness_runtime.normalize_answer(answer)
             if harness_trace is not None:
-                harness_trace["h7"].append({
+                harness_trace["h2"].append({
+                    "sub": "answer_normalise",
+                    "trigger": "commit",
                     "mutated": mutated,
                     "before": answer,
                     "after": normalized,
                 })
             if mutated:
-                logging.info(f"H7 normalised answer: {answer!r} -> {normalized!r}")
+                logging.info(f"H2 normalised answer: {answer!r} -> {normalized!r}")
             answer = normalized
 
         logging.info(f"Final answer: {answer}")

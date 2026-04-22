@@ -1,21 +1,22 @@
 """
-WebShop Harness — H0/H1/H2/H3/H4/H5/H6
+WebShop Harness — H0/H1/H2/H3/H4/H5
 
 H0  Task Parser        — one-time requirement extraction per episode
 H1  Page State Tracker — page type detection + shopping state bookkeeping
 H2  Action Gate        — validity check + fuzzy matching + repeat-click block
 H3  Tool Description   — static shopping strategy hint embedded in tool descriptions
 H4  Shopping Monitor   — search loop / price-over-budget / product-stall detection
+                         + step-budget warn/force (forced Buy Now)
+                         + product-category sanity check
 H5  Goal-directed Hint — page-type-aware per-step guidance (attribute checklist)
-H6  Budget Manager     — step-budget urgency + forced Buy Now
 
 Generalization notes:
   - All page-type detection uses environment API signals (has_search_bar, observation
     structure), which are identical across train/test splits.
   - Attribute checklist in H5 is derived purely from the task instruction + current
     page clickables — no training statistics are used.
-  - H6 force-buy only triggers when "buy now" is already in clickables (admissible
-    guard), so it never issues an invalid action.
+  - H4 budget force-buy only triggers when "buy now" is already in clickables
+    (admissible guard), so it never issues an invalid action.
 """
 
 import copy
@@ -123,7 +124,6 @@ class WebShopHarnessConfig:
     h3_enabled: bool = True
     h4_enabled: bool = True
     h5_enabled: bool = True
-    h6_enabled: bool = True
 
     # H2
     h2_click_similarity_threshold: float = 0.80  # higher than ALFWorld to avoid ASIN mis-match
@@ -133,13 +133,9 @@ class WebShopHarnessConfig:
     h4_search_loop_threshold: int = 4     # back_to_search_count triggers recovery
     h4_duplicate_search_threshold: int = 2  # same query repeated N times triggers recovery
     h4_product_stall_turns: int = 3        # turns on same product page without progress
-
-    # H5
-    h5_hint_max_words: int = 60            # word cap for per-step hints
-
-    # H6
-    h6_warn_threshold: int = 5   # remaining steps < N on SEARCH_RESULTS → urgency hint
-    h6_force_threshold: int = 3  # remaining steps < N with buy now available → force
+    h4_hint_max_words: int = 60            # word cap for H4-E per-step hints
+    h4_warn_threshold: int = 5   # H4-D: remaining steps < N on SEARCH_RESULTS → urgency hint
+    h4_force_threshold: int = 3  # H4-D: remaining steps < N with buy now available → force
 
     # Price
     price_tolerance: float = 0.05  # 5% over budget still accepted (rounding)
@@ -1154,7 +1150,8 @@ def _fuzzy_match_click(value: str, clickables: List[str], threshold: float) -> O
 
 _H3_SEARCH_HINT = (
     "Search for the product using specific keywords matching all required attributes "
-    "(item type, color, size, material, etc.). Include price constraint words if helpful."
+    "(item type, color, size, material, etc.). Do NOT include price or budget words — "
+    "WebShop search ignores price; use the product name and key features only."
 )
 _H3_CLICK_HINT = (
     "Click a product from results, select ALL required attributes "
@@ -1403,7 +1400,7 @@ def _rank_search_results(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Words that are too generic to be useful for category matching
-_H7_GENERIC_WORDS = _TASK_STOPWORDS | {
+_CATEGORY_GENERIC_WORDS = _TASK_STOPWORDS | {
     "price", "lower", "looking", "dollars", "please", "cheap", "great",
     "nice", "perfect", "best", "want", "need", "find", "look",
     # Verb/gerund forms that appear in task instructions but aren't product nouns
@@ -1424,7 +1421,7 @@ def _product_title_check(
     req: WebShopTaskRequirements,
     observation: str,
 ) -> Optional[str]:
-    """H7: Check whether the current product page is the right item category.
+    """H4 sub-check: whether the current product page is the right item category.
 
     Extracts meaningful nouns from item_keywords and checks how many appear
     in the product page observation. When overlap is very low, warns the agent
@@ -1448,7 +1445,7 @@ def _product_title_check(
 
     candidate_words: List[str] = []
     for w in re.findall(r'\b[a-z]{4,}\b', item_text):
-        if (w not in _H7_GENERIC_WORDS
+        if (w not in _CATEGORY_GENERIC_WORDS
                 and w not in _color_words
                 and w not in _size_words):
             candidate_words.append(w)
@@ -1758,7 +1755,7 @@ def _build_attribute_checklist(
             unchecked_kws = [
                 w for w in req.task_keywords
                 if w not in tracked_words
-                and w not in _H7_GENERIC_WORDS
+                and w not in _CATEGORY_GENERIC_WORDS
                 and w not in _COLOR_TOKENS   # covered by color check
                 and w not in _SIZE_TOKENS    # covered by size check
                 and len(w) >= 4
@@ -1851,6 +1848,7 @@ class WebShopHarnessRuntime:
         self._last_hint_page = ""
         self._search_loop_resets = 0
         self._asin_stall_count = {}
+        self._h4_intervened = False  # set by post_step_monitor; suppresses H4-E on same turn
 
     # ── H5 cold-start ────────────────────────────────────────────────────────
 
@@ -1906,7 +1904,7 @@ class WebShopHarnessRuntime:
             "canonicalized": False,
         }
 
-        # Apply force_next_action if set (from H5 enforcement or H6)
+        # Apply force_next_action if set (from H5 enforcement or H4 budget)
         if self.force_next_action:
             forced = self.force_next_action
             # Only yield to agent if it's doing something critical (buy now)
@@ -2155,6 +2153,7 @@ class WebShopHarnessRuntime:
             "intervention_level": "none",
             "recovery_prompt": None,
         }
+        self._h4_intervened = False  # reset each step
         if not self.config.h4_enabled or self.requirements is None:
             return response
 
@@ -2169,13 +2168,14 @@ class WebShopHarnessRuntime:
             and state.current_asin is not None
             and state._stall_turns == 1  # first turn on this product page
         ):
-            h7_warn = _product_title_check(req, observation)
-            if h7_warn:
+            title_warn = _product_title_check(req, observation)
+            if title_warn:
                 self._product_mismatch_warned = True
                 self._mismatch_buy_blocks = 0
+                self._h4_intervened = True
                 response["audit_reason"] = "product_category_mismatch"
                 response["intervention_level"] = "soft"
-                response["recovery_prompt"] = h7_warn
+                response["recovery_prompt"] = title_warn
                 return response
             else:
                 # Product title matches — clear any previous mismatch flag
@@ -2217,6 +2217,7 @@ class WebShopHarnessRuntime:
             state.back_to_search_count = 0
             if state.search_queries:
                 state.search_queries = state.search_queries[-1:]
+            self._h4_intervened = True
             return response
 
         # ② Price over budget (on product page)
@@ -2232,6 +2233,7 @@ class WebShopHarnessRuntime:
                 f"Harness: this product costs ${state.current_price:.2f} but your budget is "
                 f"${req.price_max:.0f}. Go back to search and find a cheaper option."
             )
+            self._h4_intervened = True
             return response
 
         # ③ Product page stall
@@ -2260,6 +2262,7 @@ class WebShopHarnessRuntime:
                     "Harness: you seem stuck. Click 'buy now' to purchase or 'back to search' to try another product."
                 )
             state._stall_turns = 0  # reset so we don't fire every turn
+            self._h4_intervened = True
             return response
 
         return response
@@ -2282,8 +2285,11 @@ class WebShopHarnessRuntime:
         has_search_bar: bool,
         clickables: List[str],
     ) -> Optional[str]:
-        """H5: Goal-directed per-step hint based on current page type."""
-        if not self.config.h5_enabled or self.requirements is None:
+        """H4-E: State-driven per-step guidance using H1 page state and parsed requirements."""
+        if not self.config.h4_enabled or self.requirements is None:
+            return None
+        # Skip if post_step_monitor already injected a recovery prompt this turn
+        if self._h4_intervened:
             return None
 
         state = self.page_state
@@ -2353,8 +2359,8 @@ class WebShopHarnessRuntime:
 
         # Word budget cap
         words = hint.split()
-        if len(words) > self.config.h5_hint_max_words:
-            hint = " ".join(words[:self.config.h5_hint_max_words])
+        if len(words) > self.config.h4_hint_max_words:
+            hint = " ".join(words[:self.config.h4_hint_max_words])
 
         # Dedup: suppress if page type and content unchanged
         if hint == self._last_hint and state.page_type == self._last_hint_page:
@@ -2364,16 +2370,16 @@ class WebShopHarnessRuntime:
         self._last_hint_page = state.page_type
         return hint
 
-    # ── H6 ───────────────────────────────────────────────────────────────────
+    # ── H4-D ─────────────────────────────────────────────────────────────────
 
     def budget_check(
         self,
         remaining_steps: int,
         clickables: List[str],
     ) -> Dict[str, Any]:
-        """H6: Step-budget management — urgency hint and forced Buy Now."""
+        """H4-D: Step-budget management — urgency hint and forced Buy Now."""
         response: Dict[str, Any] = {"hint": None, "force_action": None}
-        if not self.config.h6_enabled:
+        if not self.config.h4_enabled or self.requirements is None:
             return response
 
         state = self.page_state
@@ -2381,7 +2387,7 @@ class WebShopHarnessRuntime:
         buy_now_available = "buy now" in clickables_lower
 
         # Hard force: buy now in admissible and steps critical
-        if remaining_steps < self.config.h6_force_threshold and buy_now_available:
+        if remaining_steps < self.config.h4_force_threshold and buy_now_available:
             response["force_action"] = "click[buy now]"
             response["hint"] = (
                 f"[{remaining_steps} steps left] Harness: forcing 'buy now' to complete purchase."
@@ -2390,7 +2396,7 @@ class WebShopHarnessRuntime:
 
         # Soft warn: on search results page with few steps left
         if (
-            remaining_steps < self.config.h6_warn_threshold
+            remaining_steps < self.config.h4_warn_threshold
             and state.page_type in (PAGE_SEARCH_RESULTS, PAGE_HOME)
         ):
             response["hint"] = (
@@ -2399,7 +2405,7 @@ class WebShopHarnessRuntime:
 
         # Soft warn: on product page, buy now available, few steps
         if (
-            remaining_steps < self.config.h6_warn_threshold
+            remaining_steps < self.config.h4_warn_threshold
             and state.page_type == PAGE_PRODUCT_DETAIL
             and buy_now_available
         ):

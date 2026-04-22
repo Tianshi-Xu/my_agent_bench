@@ -68,7 +68,6 @@ class WebShop(Task):
         h3 = configs.pop("h3", True)
         h4 = configs.pop("h4", True)
         h5 = configs.pop("h5", True)
-        h6 = configs.pop("h6", True)
         h5_top_k = configs.pop("h5_top_k", 2)
         self.harness_config = WebShopHarnessConfig(
             enabled=bool(enabled),
@@ -76,7 +75,6 @@ class WebShop(Task):
             h3_enabled=bool(h3),
             h4_enabled=bool(h4),
             h5_enabled=bool(h5),
-            h6_enabled=bool(h6),
             h5_top_k=int(h5_top_k),
         )
         if self.harness_config.enabled and self.harness_config.h3_enabled:
@@ -160,7 +158,7 @@ class WebShop(Task):
                         role='user',
                         content=f'The initial observation:\n{observation}\n\nAvailable Actions:\n{available_actions}'
                     ))
-                    # H5 cold-start: search hint on step 0
+                    # H4-E: initial search hint on step 0
                     if harness_runtime:
                         first_hint = harness_runtime.step_guidance(
                             step_num=0,
@@ -316,31 +314,31 @@ class WebShop(Task):
                                 content=h4_result["recovery_prompt"],
                             ))
 
-                        # H5: goal-directed hint
-                        h5_hint = harness_runtime.step_guidance(
+                        # H4-E: state-driven per-step guidance (page state + requirements)
+                        h4e_hint = harness_runtime.step_guidance(
                             step_num=j + 1,
                             max_steps=self.max_rounds,
                             observation=observation,
                             has_search_bar=post_has_sb,
                             clickables=post_clickables,
                         )
-                        if h5_hint:
+                        if h4e_hint:
                             session.inject(ChatCompletionUserMessageParam(
                                 role='user',
-                                content=h5_hint,
+                                content=h4e_hint,
                             ))
 
-                        # H6: budget management
-                        h6_result = harness_runtime.budget_check(
+                        # H4-D: step-budget management
+                        budget_result = harness_runtime.budget_check(
                             remaining_steps=self.max_rounds - j - 1,
                             clickables=post_clickables,
                         )
-                        if h6_result.get("force_action"):
-                            harness_runtime.force_next_action = h6_result["force_action"]
-                        if h6_result.get("hint"):
+                        if budget_result.get("force_action"):
+                            harness_runtime.force_next_action = budget_result["force_action"]
+                        if budget_result.get("hint"):
                             session.inject(ChatCompletionUserMessageParam(
                                 role='user',
-                                content=h6_result["hint"],
+                                content=budget_result["hint"],
                             ))
 
                 history[-1]["reward"] = reward

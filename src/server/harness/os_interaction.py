@@ -1,18 +1,18 @@
 """
-OS Interaction Harness — H0/H1/H2/H3/H4/H5/H7  (v5)
+OS Interaction Harness — H0/H1/H2/H3/H4/H5  (v5)
 
 H0  Task Parser            — one-time shell-task classification per episode
 H1  Shell & Conv State     — per-round bash history, output candidates, truncation flags
 H2  Action Gate            — text-embedded tool-call rescue (JSON/kwarg/positional/bare/XML)
                              + safety filter + duplicate-bash gate
+                             + answer normalisation (strip units / prose, decimal sizes)
+                               applied at rescue time AND commit time.
 H3  Tool Description Patch — static shell strategy / tool-format hints
-H4  Post-step Monitor      — truncation / error / empty-output / loop + budget management
-                             (H6 budget logic merged here in v3 — single post-bash trigger)
+H4  Post-step Monitor      — truncation / error / empty-output / loop + budget warn/force
+                             (budget logic is part of H4 — single post-bash trigger)
 H5  Goal-directed Hint     — task-type-aware skill (BM25) + per-step guidance
                              (lint only fires when no candidate exists to avoid over-correction;
                               submit hint suppressed when H4 has active recovery prompt)
-H7  Answer Normalizer      — strip units / prose; applied at rescue time AND eval time.
-                             Normalizes decimal sizes "50.0K" → "50K" for int() compat.
 
 Architecture changes (v5 vs v4):
   - H5 round-0 submit hint changed to verification nudge: "you got 'N' on your first
@@ -49,16 +49,17 @@ Architecture changes (v4 vs v3):
   - New skills: home_dir_file_glob (glob pattern fix), ip_status_extract (awk IP+status).
 
 Architecture changes (v3 vs v2):
-  - H6 merged into H4: post_step_monitor(remaining_rounds) handles budget warn/force.
-  - H7 normalization moved to rescue time in addition to eval time.
+  - Budget management is a sub-branch of H4: post_step_monitor(remaining_rounds)
+    handles budget warn/force alongside stall/error/empty checks.
+  - Answer normalisation runs at H2 rescue time in addition to commit time.
   - Implausibility check restricted to answer_shape==ANSWER_INTEGER.
   - Zero is no longer unconditionally implausible.
 
 Generalization notes:
   - H0 parsing is commonsense regex/lexical; no training-set statistics.
   - Skill library (OS_SKILLS) ranks by BM25 against the episode's raw description.
-  - H4/H6 force only fires when H1 has a concrete plausible integer candidate.
-  - H7 normaliser is shape-conditional: only mutates if H0 set answer_shape.
+  - H4 budget force only fires when H1 has a concrete plausible integer candidate.
+  - H2 answer normaliser is shape-conditional: only mutates if H0 set answer_shape.
   - All thresholds are behavioural (round counts, repeat counts, char lengths).
 """
 
@@ -109,7 +110,7 @@ class OSHarnessConfig:
     enabled: bool = False
     h2_enabled: bool = True
     h3_enabled: bool = True
-    h4_enabled: bool = True   # includes budget management (was H6)
+    h4_enabled: bool = True   # post-step monitor + budget warn/force
     h5_enabled: bool = True
 
     # H2
@@ -120,17 +121,19 @@ class OSHarnessConfig:
     h4_stall_window: int = 3                # turns of same bash+output → stall
     h4_empty_output_threshold: int = 2      # empty outputs in a row → broaden-filter hint
 
+    # H4-E hint
+    h4_hint_max_words: int = 40
+
     # H5
-    h5_hint_max_words: int = 40
     h5_top_k: int = 2
     h5_cold_start_max_words: int = 50
 
-    # H6 (round_limit is usually 8 for os-env_train)
-    h6_warn_threshold: int = 3              # remaining <= N → soft warn
-    h6_force_threshold: int = 2             # remaining <= N + candidate ready → hard force
+    # H4 budget (thresholds used by post_step_monitor ⑦)
+    h4_budget_warn_threshold: int = 3       # remaining <= N → soft warn
+    h4_budget_force_threshold: int = 2      # remaining <= N + candidate ready → hard force
 
-    # H7
-    h7_max_strip_units: int = 1             # how many trailing unit tokens to strip
+    # H2 answer normalisation
+    h2_max_strip_units: int = 1             # how many trailing unit tokens to strip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -795,7 +798,7 @@ def is_plausible_numeric_candidate(value: Optional[str]) -> bool:
 
     Returns False for values that almost always indicate the bash pipeline
     produced garbage (awk overflow, empty-set count 0 for filter tasks, huge
-    negatives).  Used by H4/H6 to refuse auto-submit / auto-force.
+    negatives).  Used by H4 budget to refuse auto-submit / auto-force.
     """
     if value is None:
         return False
@@ -1068,7 +1071,7 @@ def _is_dangerous_bash(script: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# H7 — Answer normaliser
+# H2 — Answer normaliser (interface-boundary repair at rescue / commit)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ANSWER_STRIP_PREFIXES = [
@@ -1087,7 +1090,7 @@ _ANSWER_UNIT_TOKENS = {
 
 
 def normalize_answer(value: str, answer_shape: Optional[str]) -> Tuple[str, bool]:
-    """H7: Normalise submitted answer based on H0's answer_shape.
+    """H2: Normalise submitted answer based on H0's answer_shape.
 
     Returns (normalized, mutated). Passthrough when shape is None.
     """
@@ -1138,7 +1141,7 @@ def normalize_answer(value: str, answer_shape: Optional[str]) -> Tuple[str, bool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Runtime — glues H0..H7 together
+# Runtime — glues H0..H5 together
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -1235,8 +1238,9 @@ class OSHarnessRuntime:
                 response["reason"] = f"dangerous_bash:{dpat}"
                 return response
             # Duplicate-bash gate: if the last two bash commands match raw_value
-            # AND we have a PLAUSIBLE candidate answer ready → promote H6 to
-            # force answer.  Never auto-submit an implausible candidate (0 on a
+            # AND we have a PLAUSIBLE candidate answer ready → promote H4
+            # budget force to submit the answer.  Never auto-submit an
+            # implausible candidate (0 on a
             # filter task, awk overflow, …) — better to let the agent retry
             # with a corrected pipeline.
             hist = self.state.bash_history
@@ -1308,15 +1312,15 @@ class OSHarnessRuntime:
     def note_rescue_hit(self) -> None:
         self.state.rescue_hits += 1
 
-    # ── H4 + H6 (merged) ────────────────────────────────────────────────────
+    # ── H4 (post-step monitor, incl. budget warn/force) ──────────────────────
 
     def post_step_monitor(self, remaining_rounds: int = 99) -> Dict[str, Any]:
         """Inspect H1 state and return a recovery prompt + optional force.
 
-        H6 budget logic is integrated here so there is a single post-bash
-        monitoring trigger rather than two separate insertion points.
-        remaining_rounds is round_limit - current_round_num (inclusive of this
-        round that just finished).
+        Budget warn/force is a sub-branch inside this function so there is a
+        single post-bash monitoring trigger rather than two separate insertion
+        points.  remaining_rounds is round_limit - current_round_num (inclusive
+        of this round that just finished).
         Updates st.h4_fired_last_round so the post-ls nudge (⑥) can fire next round.
         """
         response: Dict[str, Any] = {
@@ -1469,12 +1473,12 @@ class OSHarnessRuntime:
             )
             return _return(response)
 
-        # ⑦ Budget management (absorbed from H6) — fires after bash; net effect
+        # ⑦ Budget warn/force — H4 sub-branch, fires after bash; net effect
         # is identical to a round-top check since both inject before next LLM call.
         if not st.answered:
             rem = remaining_rounds - 1  # rounds left after this one completes
             if (
-                rem <= self.config.h6_force_threshold
+                rem <= self.config.h4_budget_force_threshold
                 and ctx.answer_shape == ANSWER_INTEGER
                 and st.candidate_numeric_answer
                 and not st.candidate_implausible
@@ -1489,7 +1493,7 @@ class OSHarnessRuntime:
                     f"'{st.candidate_numeric_answer}'."
                 )
                 return _return(response)
-            if rem <= self.config.h6_warn_threshold:
+            if rem <= self.config.h4_budget_warn_threshold:
                 response["audit_reason"] = "budget_warn"
                 if (
                     st.candidate_numeric_answer
@@ -1514,7 +1518,7 @@ class OSHarnessRuntime:
         return _return(response)
 
 
-    # ── H5 per-step guidance ────────────────────────────────────────────────
+    # ── H4-E: state-driven per-step guidance ────────────────────────────────
 
     def step_guidance(
         self,
@@ -1522,14 +1526,14 @@ class OSHarnessRuntime:
         max_rounds: int,
         h4_audit_active: bool = False,
     ) -> Optional[str]:
-        """Return a per-step guidance hint for the agent.
+        """H4-E: Per-step guidance driven by H1 runtime state (candidate answers, bash history).
 
         h4_audit_active: True when H4 just fired a recovery_prompt this same
         round.  In that case, suppress the "submit" hint (②, string promotion)
         so the model only sees H4's recovery message and doesn't follow a
         conflicting "submit '0'" hint instead.  Lint (①) is still allowed.
         """
-        if not self.config.h5_enabled or self.task_ctx is None:
+        if not self.config.h4_enabled or self.task_ctx is None:
             return None
         ctx = self.task_ctx
         st = self.state
@@ -1630,8 +1634,8 @@ class OSHarnessRuntime:
             return None
 
         words = hint.split()
-        if len(words) > self.config.h5_hint_max_words:
-            hint = " ".join(words[: self.config.h5_hint_max_words])
+        if len(words) > self.config.h4_hint_max_words:
+            hint = " ".join(words[: self.config.h4_hint_max_words])
 
         if hint == self._last_hint:
             return None
@@ -1684,60 +1688,7 @@ class OSHarnessRuntime:
             )
         return None
 
-    # ── H6 ──────────────────────────────────────────────────────────────────
-
-    def budget_check(self, remaining_rounds: int) -> Dict[str, Any]:
-        response: Dict[str, Any] = {"hint": None, "force_action": None}
-        if not self.config.h6_enabled or self.task_ctx is None:
-            return response
-        if self.state.answered:
-            return response
-        ctx = self.task_ctx
-        st = self.state
-
-        # Hard force with extracted candidate — only when plausible.  An
-        # implausible 0 / overflow that gets force-submitted scores 0 and also
-        # robs the agent of the final round to retry.
-        if (
-            remaining_rounds <= self.config.h6_force_threshold
-            and ctx.answer_shape == ANSWER_INTEGER
-            and st.candidate_numeric_answer
-            and not st.candidate_implausible
-        ):
-            response["force_action"] = {
-                "name": "answer_action",
-                "arguments": {"answer": st.candidate_numeric_answer},
-            }
-            response["hint"] = (
-                f"[{remaining_rounds} rounds left] Harness: forcing answer_action with "
-                f"'{st.candidate_numeric_answer}'."
-            )
-            return response
-
-        # Soft warn
-        if remaining_rounds <= self.config.h6_warn_threshold:
-            if (
-                st.candidate_numeric_answer
-                and ctx.answer_shape == ANSWER_INTEGER
-                and not st.candidate_implausible
-            ):
-                response["hint"] = (
-                    f"[{remaining_rounds} rounds left] Submit now: "
-                    f"answer_action(answer='{st.candidate_numeric_answer}')."
-                )
-            elif st.candidate_implausible:
-                response["hint"] = (
-                    f"[{remaining_rounds} rounds left] Your last pipeline produced an "
-                    "implausible value. Broaden the filter or switch tools before submitting."
-                )
-            else:
-                response["hint"] = (
-                    f"[{remaining_rounds} rounds left] If you have a candidate answer, "
-                    "submit it immediately via answer_action."
-                )
-        return response
-
-    # ── H7 ──────────────────────────────────────────────────────────────────
+    # ── H2 answer normalisation ──────────────────────────────────────────────
 
     def normalize_answer(self, value: str) -> Tuple[str, bool]:
         if self.task_ctx is None:

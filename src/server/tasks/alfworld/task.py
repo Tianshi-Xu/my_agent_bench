@@ -36,10 +36,9 @@ class ALFWorld(Task):
                  **kwargs):
         enabled = kwargs.pop("enabled", False)
         h2 = kwargs.pop("h2", True)
-        h3 = kwargs.pop("h3", False)
-        h4 = kwargs.pop("h4", False)
-        h5 = kwargs.pop("h5", False)
-        h6 = kwargs.pop("h6", True)
+        h3 = kwargs.pop("h3", True)
+        h4 = kwargs.pop("h4", True)
+        h5 = kwargs.pop("h5", True)
         h5_top_k = kwargs.pop("h5_top_k", 1)
         self.harness_config = ALFWorldHarnessConfig(
             enabled=bool(enabled),
@@ -47,7 +46,6 @@ class ALFWorld(Task):
             h3_enabled=bool(h3),
             h4_enabled=bool(h4),
             h5_enabled=bool(h5),
-            h6_enabled=bool(h6),
             h5_top_k=int(h5_top_k),
         )
         if self.harness_config.enabled and self.harness_config.h3_enabled:
@@ -203,7 +201,7 @@ class ALFWorld(Task):
         ob = '\n'.join(ob[0].split('\n\n')[1:])
         log_info = {
             "log": [],
-            "harness_trace": {"h2": [], "h3": [], "h4": [], "h5": [], "h6": []},
+            "harness_trace": {"h2": [], "h3": [], "h4": [], "h5": []},
         }
         harness_runtime = None
         if self.harness_config.enabled:
@@ -262,7 +260,7 @@ class ALFWorld(Task):
                 if (
                     _no_tool_consecutive >= 2
                     and harness_runtime
-                    and self.harness_config.h5_enabled
+                    and self.harness_config.h4_enabled
                 ):
                     forced_hint = harness_runtime.step_guidance(
                         current_round=i + 1,
@@ -362,16 +360,26 @@ class ALFWorld(Task):
                         role='user',
                         content=h4["recovery_prompt"],
                     ))
-            if harness_runtime and self.harness_config.h3_enabled:
-                log_info["harness_trace"]["h3"].append(
-                    {
-                        "round": i + 1,
-                        "hint_applied": True,
-                        "token_cost": self.harness_config.h3_max_words,
-                    }
+                # H4-D: step-budget management
+                budget = harness_runtime.budget_check(
+                    remaining_steps=self.max_step - i - 1,
+                    admissible=post_admissible,
                 )
-            # H5 per-step goal-directed guidance
-            if harness_runtime and self.harness_config.h5_enabled:
+                if budget.get("force_action"):
+                    harness_runtime.force_next_action = budget["force_action"]
+                if budget.get("hint"):
+                    session.inject(ChatCompletionUserMessageParam(
+                        role='user',
+                        content=budget["hint"],
+                    ))
+                if budget.get("force_action") or budget.get("hint"):
+                    log_info["harness_trace"]["h4"].append({
+                        "round": i + 1,
+                        "sub": "h4d_budget",
+                        "forced": budget.get("force_action"),
+                        "hint": budget.get("hint"),
+                    })
+                # H4-E: state-driven per-step guidance (WorldModel + SubgoalSM)
                 step_hint = harness_runtime.step_guidance(
                     current_round=i + 1,
                     max_step=self.max_step,
@@ -382,30 +390,20 @@ class ALFWorld(Task):
                         role='user',
                         content=step_hint,
                     ))
-                    log_info["harness_trace"]["h5"].append({
+                    log_info["harness_trace"]["h4"].append({
                         "round": i + 1,
+                        "sub": "h4e_step_guidance",
                         "text": step_hint,
-                        "trigger": "step_guidance",
                         "token_cost": str(len(step_hint.split())),
                     })
-            # H6 step-budget management
-            if harness_runtime and self.harness_config.h6_enabled:
-                h6 = harness_runtime.budget_check(
-                    remaining_steps=self.max_step - i - 1,
-                    admissible=post_admissible,
+            if harness_runtime and self.harness_config.h3_enabled:
+                log_info["harness_trace"]["h3"].append(
+                    {
+                        "round": i + 1,
+                        "hint_applied": True,
+                        "token_cost": self.harness_config.h3_max_words,
+                    }
                 )
-                if h6.get("force_action"):
-                    harness_runtime.force_next_action = h6["force_action"]
-                if h6.get("hint"):
-                    session.inject(ChatCompletionUserMessageParam(
-                        role='user',
-                        content=h6["hint"],
-                    ))
-                log_info["harness_trace"]["h6"].append({
-                    "round": i + 1,
-                    "forced": h6.get("force_action"),
-                    "hint": h6.get("hint"),
-                })
 
             # failure test
             if len(log_info["log"]) > 3:

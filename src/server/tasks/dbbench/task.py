@@ -84,7 +84,7 @@ class DBBenchTask(Task):
             h4_empty_threshold=h4_empty,
             h4_budget_warn_threshold=h4_bwarn,
             h4_budget_force_threshold=h4_bforce,
-            h5_hint_max_words=h5_words,
+            h4_hint_max_words=h5_words,
         )
 
         # H3: patch tool descriptions once at class init.
@@ -451,15 +451,16 @@ class DBBenchTask(Task):
                                         content=h4_result["recovery_prompt"],
                                     ))
 
-                        # ── H5: step guidance ──────────────────────────────
-                        if harness_runtime is not None and self.harness_config.h5_enabled:
+                        # ── H4-E: state-driven per-step guidance ───────────
+                        if harness_runtime is not None and self.harness_config.h4_enabled:
                             hint = harness_runtime.step_guidance(
                                 round_num=current_round,
                                 h4_audit_active=h4_audit_active,
                             )
                             if hint:
-                                harness_trace["h5"].append({
+                                harness_trace["h4"].append({
                                     "round": current_round + 1,
+                                    "sub": "h4e_step_guidance",
                                     "hint": hint[:200],
                                 })
                                 session.inject(ChatCompletionUserMessageParam(

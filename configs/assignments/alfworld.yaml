@@ -3,9 +3,9 @@ import: definition.yaml
 concurrency:
   task:
     alfworld-env_train: 16
-    alfworld-std: 16
+    alfworld-std: 32
   agent:
-    qwen3-4b-instruct: 16
+    qwen3-4b-instruct: 32
 
 assignments:
   - agent:

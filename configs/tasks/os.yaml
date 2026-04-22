@@ -10,7 +10,7 @@ default:
     h3: true   # static shell-strategy / tool-format hints
     h4: true   # post-step monitor: truncation / errors / empty / loop + budget warn/force
     h5: true   # BM25 skill library (27 skills) + per-step guidance
-    # h6 / h7 removed: budget absorbed into h4; normalisation is always-on
+    # Only h2/h3/h4/h5 are exposed — budget lives in h4, answer normalisation in h2.
     h5_top_k: 2
     tools:
       - type: "function"
@@ -118,7 +118,7 @@ os-env_train:
     h3: true
     h4: true
     h5: true
-    h5_top_k: 2
+    h5_top_k: 3
     data_config:
       files:
         - problem_file: data/os_interaction/train_0317/training.json
