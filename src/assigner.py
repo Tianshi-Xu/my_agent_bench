@@ -207,12 +207,16 @@ class Assigner:
                         edges[(agent_node_index[agent], task_node_index[task])] = len(
                             self.remaining_tasks[agent][task]
                         )
-            if tot_remaining_samples == 0:
-                if self.running_count == 0:
-                    break
-                else:
-                    time.sleep(interval / 2 + random.random() * interval)
-                    continue
+                # Check exit condition inside the lock so remaining_tasks and
+                # running_count are read atomically, preventing a race where
+                # finish_callback re-inserts a retry between the two checks.
+                should_exit = (tot_remaining_samples == 0 and self.running_count == 0)
+                should_wait = (tot_remaining_samples == 0 and self.running_count > 0)
+            if should_exit:
+                break
+            if should_wait:
+                time.sleep(interval / 2 + random.random() * interval)
+                continue
 
             # Step 2. Create graph and calculate max flow
 

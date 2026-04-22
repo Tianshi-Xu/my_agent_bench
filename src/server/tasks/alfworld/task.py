@@ -251,7 +251,8 @@ class ALFWorld(Task):
 
             if not tool_calls:
                 _no_tool_consecutive += 1
-                finish_reason = SampleStatus.AGENT_VALIDATION_FAILED
+                # Do not set finish_reason here — this is a mid-episode event,
+                # not a terminal state. The episode continues via `continue`.
                 no_exec_msg = (
                     'You MUST call the take_action tool — '
                     'do NOT output plain text without a tool call.'
@@ -302,7 +303,7 @@ class ALFWorld(Task):
                         }
                     )
                     if h2["blocked"]:
-                        finish_reason = SampleStatus.AGENT_INVALID_ACTION
+                        # Do not set finish_reason — mid-episode block, episode continues.
                         session.inject(ChatCompletionUserMessageParam(
                             role='user',
                             content=(
@@ -315,7 +316,7 @@ class ALFWorld(Task):
                 else:
                     action = process_action(output, admissible_commands)
             except:
-                finish_reason = SampleStatus.AGENT_INVALID_ACTION
+                # Do not set finish_reason — mid-episode exception, episode continues.
                 session.inject(ChatCompletionUserMessageParam(
                     role='user',
                     content='No valid tool calls found. Please call a tool instead.'

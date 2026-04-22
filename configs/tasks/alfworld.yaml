@@ -33,11 +33,11 @@ alfworld-std:
   parameters:
     name: alfworld-std
     split: "new_std"
-    enabled: false
+    enabled: true
     h2: true
     h3: true
     h4: true
-    h5: true
+    h5: false
     h6: true
     h5_top_k: 3
 

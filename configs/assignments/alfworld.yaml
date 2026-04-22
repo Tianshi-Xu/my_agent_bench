@@ -14,6 +14,6 @@ assignments:
       - alfworld-std
       # - alfworld-env_train
 
-output: "outputs/alfworld/{TIMESTAMP}"
+output: "outputs/alfworld/{TIMESTAMP}-no-h5"
 
-trials: 5
+trials: 1
