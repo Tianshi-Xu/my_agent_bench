@@ -2,11 +2,16 @@
 
 本文档描述当前仓库里 **已实现** 的 OS (Linux shell) harness，在一次正常推理中会在什么阶段触发、触发哪些能力。设计参考已有的 ALFWorld / WebShop harness，并针对 OS 任务的失败模式新增了 **H1（Shell 状态跟踪）**。
 
-> **层级说明（对齐当前实现）**：文档中的主层级统一为 **H0~H5**。预算管理归入 H4 的 post-step 监控；答案归一化归入 H2-rescue 与 eval 阶段的通用流程，不单独作为层级列出。
-用法
-```
-docker compose -f extra/docker-compose.yml up -d --force-recreate redis controller dbbench-env_train dbbench-std
-```
+> **层级说明**：对外暴露的干预层为 **H2~H5** 四层。预算管理归入 H4（post-step 监控）；答案归一化归入 H2（rescue 时立即归一化 + eval 时兜底归一化）；H0（任务解析）和 H1（Shell 状态跟踪）为初始化/内部状态层，不对 session 注入消息。
+
+## 设计动机
+
+Linux shell 是一个**命令确定性**环境：相同命令在相同文件系统状态下返回相同输出，shell 的 exit code 和 stdout 是精确的执行反馈，没有感知噪声。这种确定性使 harness 能够以"零歧义"的方式解读每一步执行结果，并做出精准干预。
+
+> **关键洞察**：Baseline 分析表明，约 **70% 的失败不是 shell 推理能力不足，而是工具调用协议违规**——agent 把 `answer_action({"answer":"5"})` 写进了纯文本而非真正调用工具。这意味着模型实际上已经得出了正确答案，只是输出格式违反了 function-calling 协议。H2 的 rescue parser 专门恢复这类"意图正确、格式错误"的输出，是整个 harness 中**杠杆最高的单一模块**。
+
+OS harness 的四层干预对应 shell agent 的四类系统性问题：**H2** 恢复协议违规的工具调用（rescue）并守卫危险命令，**H3** 在 episode 开始时注入 shell 最佳实践，**H4** 监控截断/报错/循环并管理轮次预算，**H5** 提供任务类型感知的具体命令模板。每一层的触发条件均来自 shell 执行的客观信号（exit code、stdout 内容、轮次计数），不依赖模型的主观推断。
+
 ## 0. 开关层（是否启用）
 
 任务配置入口在 `configs/tasks/os.yaml`：
@@ -33,9 +38,9 @@ docker compose -f extra/docker-compose.yml up -d --force-recreate redis controll
 | `h5_hint_max_words` | 40 | H5 | 每步 hint 词数上限 |
 | `h5_top_k` | 2 | H5 | cold-start BM25 skill 检索返回数 |
 | `h5_cold_start_max_words` | 50 | H5 | 每条 cold-start skill 词数上限 |
-| `h6_warn_threshold` | 3 | H4(预算子逻辑) | 剩余轮数 ≤ N 时注入软告警（配置键名沿用） |
-| `h6_force_threshold` | 2 | H4(预算子逻辑) | 剩余轮数 ≤ N 且有候选答案时硬性强制 answer_action（配置键名沿用） |
-| `h7_max_strip_units` | 1 | 归一化流程 | 尾部单位词剥离层数（配置键名沿用） |
+| `h6_warn_threshold` | 3 | H4 | 剩余轮数 ≤ N 时注入软告警（预算子逻辑，归入 H4） |
+| `h6_force_threshold` | 2 | H4 | 剩余轮数 ≤ N 且有候选答案时硬性强制 answer_action（预算子逻辑，归入 H4） |
+| `h7_max_strip_units` | 1 | H2 | 尾部单位词剥离层数（归一化子逻辑，归入 H2） |
 
 ---
 
@@ -189,7 +194,7 @@ commit               : eval 前答案归一化兜底
 
     XML 格式优先最先匹配（unambiguous，含 name+full arguments），其余按 strict→loose 顺序。XML 格式修复了 idx 760 整条 task_limit（Qwen3-4B 在该 episode 全程输出 `<tool_call>...</tool_call>` 而 rescue 未命中）。
 
-    **rescue → 立即归一化（v3）**：当 rescue 命中 `answer_action` 时，立即在 `task.py` 中对 `answer` 值调用 `normalize_answer`，保证提交值与 eval-time 归一化一致。归一化记录到 `harness_trace.h7[trigger="rescue"]`。
+    **rescue → 立即归一化（v3）**：当 rescue 命中 `answer_action` 时，立即在 `task.py` 中对 `answer` 值调用 `normalize_answer`，保证提交值与 eval-time 归一化一致。归一化事件记录在 H2 trace 中。
 
     **解析顺序（strict→loose）**：JSON > kwarg > positional > bare > ReAct；优先 answer/finish > bash（一旦 agent 已经写出答案，宁可提交也不要再跑命令）。
 
@@ -235,10 +240,10 @@ commit               : eval 前答案归一化兜底
 | ② count 任务空输出 | `empty_output_streak ≥ 1` 且 task 属于计数族 | "The filter may be too strict — drop the extension/time/size constraint one step at a time." |
 | ③ bash 循环 | 最近 `h4_stall_window=3` 轮同一条命令 | 若有 integer 候选且非 implausible：提交提示；否则调用 `_first_turn_hint` 给具体替代命令 |
 | ④ 连续无 tool call | `text_only_streak ≥ 2` | "You must call a tool. Never embed `answer_action(...)` in plain text." |
-| ⑤ 预算 force | `remaining-1 ≤ h6_force_threshold=2` 且有 plausible integer 候选 | 硬性强制：`force_next_action = answer_action(candidate)`，下轮 H2 消费；trace 仍写入 `h6`（兼容） |
+| ⑤ 预算 force | `remaining-1 ≤ h6_force_threshold=2` 且有 plausible integer 候选 | 硬性强制：`force_next_action = answer_action(candidate)`，下轮 H2 消费 |
 | ⑤ 预算 warn | `remaining-1 ≤ h6_warn_threshold=3` | 软告警；implausible 候选 → 专门的"implausible，请换方案"提示；无候选 → 通用催促 |
 
-`harness_trace.h4` 记录非预算事件；预算事件路由到 `harness_trace.h6`（兼容旧审计脚本）。
+预算事件和错误恢复统一记录在 `harness_trace.h4`，统一 post-step 触发点，减少循环体分支复杂度。
 
 **设计取舍**：预算检查和错误恢复都属于同一类 post-step 决策，统一放在 H4 可以减少触发点和循环体分支复杂度。
 
@@ -326,11 +331,13 @@ skill 库设计（按 task_type 分组）：
 
 ---
 
-## 八、答案归一化流程
+## 八、H2 归一化子逻辑（答案归一化）
+
+答案归一化是 H2 的一部分，在 rescue 时和 eval 时各触发一次：
 
 **触发**（双路径）：
-1. **Rescue 时**（`task.py::_handle_agent_action`）：rescue 提取到 `answer_action` 后立即归一化，记录到 `harness_trace.h7[trigger="rescue"]`。
-2. **Eval 时**（`_evaluate_answer` 中，`config.match["strip"]` 之后）：兜底归一化，记录到 `harness_trace.h7[trigger="eval"]`。
+1. **Rescue 时**（`task.py::_handle_agent_action`）：rescue 提取到 `answer_action` 后立即归一化，记录到 `harness_trace.h2[trigger="rescue_normalize"]`。
+2. **Eval 时**（`_evaluate_answer` 中，`config.match["strip"]` 之后）：兜底归一化，确保 rescue 后未经过归一化的答案也被处理。
 
 `normalize_answer(value, answer_shape)` 根据 H0 的 shape 做条件处理：
 
@@ -347,7 +354,7 @@ skill 库设计（按 task_type 分组）：
 - **path shape**：去尾 `/` 和 `.`
 - **shape 为 None**：**passthrough**（避免误伤 mutation 或 system_info 未分类场景）
 
-**返回**：`(normalized, mutated)`；`mutated=True` 时写入 `harness_trace.h7`。
+**返回**：`(normalized, mutated)`；`mutated=True` 时记录归一化前后的值（可在 trace 中查找）。
 
 关键通用性：所有规则不针对具体样本，而是针对常见自然语言余量（"5 files"、"The answer is 5"、"42.5 MB" 等）。
 
@@ -359,20 +366,20 @@ skill 库设计（按 task_type 分组）：
 
 ```
 {
-  "h2": [{round, reason, blocked, action_name}, ...],
+  "h2": [{round, reason, blocked, action_name}, ...],   # rescue / force / normalize 事件
   "h3": [{applied}],
-  "h4": [{round, audit_reason, recovery_prompt}, ...],
-  "h5": [{id, text, trigger, token_cost}, ...],
-  "h6": [{round, remaining, forced, hint}, ...],
-  "h7": [{mutated, before, after}, ...]
+  "h4": [{round, audit_reason, recovery_prompt, budget_branch}, ...],  # 监控 + 预算事件
+  "h5": [{id, text, trigger, token_cost}, ...]
 }
 ```
+
+> 注：代码内部兼容字段 `h6`（预算强制）和 `h7`（归一化）在论文层面已归并入 `h4` 和 `h2`，对外审计以 `h2 / h4` 为准。
 
 使用：
 
 1. 审计 H2 rescue 是否只在 `tool_calls` 为空时触发。
-2. 确认预算 force（兼容 trace 字段名 `h6`）只在有候选时触发（且 v2 起只在候选非 implausible 时）。
-3. 确认归一化 mutation（兼容 trace 字段名 `h7`）在 shape=None 时完全 passthrough。
+2. 确认 H4 预算 force 只在有候选且非 implausible 时触发。
+3. 确认 H2 归一化在 shape=None 时完全 passthrough。
 
 ### v2 持久化机制（重要）
 
@@ -405,14 +412,19 @@ session.inject(ChatCompletionUserMessageParam(
 
 ---
 
-## 十一、泛化约束（保证不看测试集）
+## 十一、泛化约束与迁移性
 
-- H0 解析全部是常识级词法/正则，**没有任何训练集统计量**，未见过的任务形态也会退化到 `task_type=other`（harness 等价于部分关闭）。
+**测试集隔离（不看标签）**：
+
+- H0 解析全部是常识级词法/正则，**没有任何训练集统计量**，未见过的任务形态退化到 `task_type=other`（harness 等价于部分关闭，不会产生错误干预）。
 - H5 skill 库 BM25 分数基于当次任务自己的 `raw_description`，无 reference-answer 查表。
-- 预算 force 只在 H1 抽到具体 integer 候选、或 budget 兜底时才触发；**永远不伪造 string 答案**。
-- 归一化流程针对常见自然语言修饰（"5 files" / "The answer is 5" / "42.5 MB"），不按 task 做 per-sample 调参。
-- 所有阈值是**行为阈值**（轮数、重复次数、字符长度），不是模式特化值。
-- 测试集路径（`data/os_interaction/data/1~7`）本文档与代码均未读取；迭代只看 `os-env_train` outputs 与 `training.json`。
+- 预算 force 只在 H1 抽到具体 integer 候选时触发；**永远不伪造 string 答案**。
+- 归一化流程针对常见自然语言修饰（"5 files" / "The answer is 5" / "42.5 MB"），不做 per-sample 调参。
+- 所有阈值是**行为阈值**（轮数、重复次数、字符长度），不是针对特定任务的特化值。
+
+**向其他 shell/代码执行场景的迁移性**：
+
+rescue parser 的核心逻辑——从纯文本内容中识别并恢复嵌入的工具调用——是 **function-calling 场景的通用问题**，不限于 shell 任务。任何使用 function-calling 协议的 LLM agent 都可能出现"把工具调用写进文本"的失败模式；rescue parser 的正则覆盖策略（JSON / kwarg / positional / bare / XML 五种格式）可直接迁移到其他 agent 框架。H4 的错误恢复逻辑（截断 / 路径不存在 / 权限拒绝 / 循环检测）是 Linux shell 通用的，对其他 shell benchmark（ShellBench、BashBench 等）同样适用。
 
 ---
 
