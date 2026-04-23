@@ -239,7 +239,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "If the task mentions 'subdirectories' or 'recursively', use `find` "
             "(always recursive by default) or `grep -r`. Plain `ls` and `grep` "
-            "without `-r` do NOT descend into subdirectories."
+            "without `-r` do not descend into subdirectories."
         ),
     },
     {
@@ -258,7 +258,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "To count lines containing a pattern: `grep -rh PATTERN DIR --include='*.EXT' | wc -l`. "
             "For case-insensitive, add -i: `grep -rhi PATTERN DIR | wc -l`. "
-            "NEVER pipe `grep -c FILE` to `wc -l` — `grep -c` returns count *per file*; "
+            "Never pipe `grep -c FILE` to `wc -l` — `grep -c` returns a count per file; "
             "`wc -l` then counts files, not total matching lines."
         ),
     },
@@ -354,7 +354,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "task_types": _ALL_TASK_TYPES,
         "keywords": ["already", "have", "answer", "submit", "result"],
         "text": (
-            "If the last bash output already contains your answer, do NOT re-run "
+            "If the last bash output already contains your answer, do not re-run "
             "the same command — submit your final answer immediately."
         ),
     },
@@ -364,7 +364,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "keywords": ["truncate", "truncated", "long", "output", "large"],
         "text": (
             "If output is truncated, refine the command — add `| wc -l`, "
-            "`| head -20`, or a narrower filter. Do NOT re-run the same command."
+            "`| head -20`, or a narrower filter. Do not re-run the same command."
         ),
     },
     {
@@ -384,7 +384,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "When the task says 'today', get the actual date with `date +%Y-%m-%d` and use it in "
             "your grep: `grep \"$(date +%Y-%m-%d)\" FILE | ...`. "
-            "Do NOT hardcode a date from the log file — that may be the wrong day."
+            "Do not hardcode a date from the log file — it may be the wrong day."
         ),
     },
     # ── v2 specialised skills (added after 2026-04-18 eval) ──────────────────
@@ -395,7 +395,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "For 'total size … human-readable', use `du -ch $(find DIR -type f -name '*.EXT') "
             "| tail -1 | awk '{print $1}'` — output is '50K' (integer, no decimal). "
-            "Do NOT use `printf \"%.1fK\"` — the evaluator needs int() parseable values."
+            "Do not use `printf \"%.1fK\"` — the evaluator expects int()-parseable values."
         ),
     },
     {
@@ -482,7 +482,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "To extract unique dates from log files: "
             "`grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' ~/logs/*.log | sort -u | wc -l`. "
-            "NEVER grep for literal 'YYYY-MM-DD' or 'MM/DD/YYYY' — those are templates, "
+            "Never grep for literal 'YYYY-MM-DD' or 'MM/DD/YYYY' — those are templates, "
             "not real dates. Run `head -3 FILE` first to see the actual date format."
         ),
     },
@@ -506,7 +506,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
             "For HTTP access logs: count unique IPs with status code N: "
             "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`. "
             "For SSH/auth logs: `grep 'Failed password' /var/log/auth.log | awk '{print $11}' | sort -u | wc -l`. "
-            "Do NOT grep for the status code after extracting IPs — the status code is in a different field."
+            "Do not grep for the status code after extracting IPs — the status code is in a different field."
         ),
     },
 ]
@@ -1226,9 +1226,7 @@ class OSHarnessRuntime:
         )
         result: List[Dict[str, str]] = []
         for skill in skills:
-            text = _truncate_to_word_budget(
-                skill["text"], self.config.h5_cold_start_max_words
-            )
+            text = skill["text"]
             result.append({
                 "id": skill["id"],
                 "text": text,

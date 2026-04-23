@@ -500,17 +500,16 @@ class OSInteraction(Task):
                 harness_trace["h3"].append({"applied": True})
 
         # 注入初始消息 + H5 cold-start
-        self._inject_initial_messages(session, config.description)
+        cold_skills = []
         if harness_runtime and self.harness_config.h5_enabled:
             cold_skills = harness_runtime.cold_start_skill_hints()
-            if cold_skills:
-                skill_lines = [f"- {item['text']}" for item in cold_skills]
-                session.inject(ChatCompletionUserMessageParam(
-                    role='user',
-                    content="Harness skill hints for this task:\n" + "\n".join(skill_lines),
-                ))
             for item in cold_skills:
                 harness_trace["h5"].append(item)
+        tips_text = None
+        if cold_skills:
+            skill_lines = [f"- {item['text']}" for item in cold_skills]
+            tips_text = "Some tips that may help for this task:\n" + "\n".join(skill_lines)
+        self._inject_initial_messages(session, config.description, tips_text=tips_text)
 
         # 初始化状态变量
         finish = False
@@ -624,7 +623,12 @@ class OSInteraction(Task):
         logging.info("Execution setup completed successfully")
         return None
 
-    def _inject_initial_messages(self, session: Session, description: str) -> None:
+    def _inject_initial_messages(
+            self,
+            session: Session,
+            description: str,
+            tips_text: Optional[str] = None
+    ) -> None:
         """注入系统消息和问题描述"""
         # 系统消息
         system_message = """You are an assistant that will act like a person. I will play the role of a Linux (Ubuntu) operating system.
@@ -636,6 +640,9 @@ Note that if you think the task has been finished, or there is some message miss
 Also, note that if you have gotten the answer to the question, you should call the "answer_action" tool instead of simply writing your answer in your response.
 Your answers should be exact and precise (for example, a single number), do not answer with full sentences or phrases.
 Always use a tool provided instead of simply responding with content."""
+
+        if tips_text:
+            system_message = system_message + "\n\n" + tips_text
 
         session.inject(ChatCompletionSystemMessageParam(
             role='system',

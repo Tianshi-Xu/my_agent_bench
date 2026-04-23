@@ -282,10 +282,10 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "expensive", "cost", "afford", "close", "lower", "dollars",
         ],
         "text": (
-            "If a product is slightly above budget (within ~5%), buy it anyway — "
-            "a close match is better than no purchase. Do not waste turns searching "
-            "for a cheaper alternative that may not exist. "
-            "Only skip products that are significantly over budget (>20%)."
+            "If a product is only slightly above budget (about 5%), buy it. "
+            "A near match is better than no purchase. Do not spend many turns hunting "
+            "for cheaper options that may not exist. Skip only clearly overpriced items "
+            "(for example above 20%)."
         ),
     },
     {
@@ -299,10 +299,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "charcoal", "aqua", "blue", "green", "pink", "grey", "gray", "gold",
         ],
         "text": (
-            "For compound colors like 'light blue', 'fuchsia pink', 'sky blue': "
-            "look for the FULL compound color option on the page first. "
-            "If only a partial match exists (e.g., 'blue' when you need 'light blue'), "
-            "click the closest partial match — do NOT skip color selection."
+            "For compound colors like 'light blue' or 'fuchsia pink', first look for "
+            "an exact compound option. If only a partial option exists (for example "
+            "'blue'), choose the closest partial match instead of skipping color selection."
         ),
     },
     {
@@ -313,9 +312,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "size", "fit", "length",
         ],
         "text": (
-            "For sizes with fit modifiers like 'petite small' or 'tall large', "
-            "look for the combined option (e.g., 'small petite') rather than "
-            "just the base size. The combined option is the correct one."
+            "For sizes with fit modifiers (like 'petite small' or 'tall large'), "
+            "select the combined option (for example 'small petite'), not only "
+            "the base size."
         ),
     },
     {
@@ -326,10 +325,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "count", "piece", "gb", "tb", "ml", "liter",
         ],
         "text": (
-            "When the task specifies measurements (e.g., '8 ounce', '6.6 feet', "
-            "'32 gb'), look for these as selectable options on the product page. "
-            "They may appear in 'size' or 'other' option groups. "
-            "Select the correct measurement before buying."
+            "When the task specifies measurements (like '8 ounce', '6.6 feet', "
+            "or '32 gb'), select that value on the product page before buying. "
+            "It may appear under 'size' or another option group."
         ),
     },
     {
@@ -340,10 +338,10 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "honey", "sugar", "spice", "option", "pack",
         ],
         "text": (
-            "Food products often have flavor/variant options that must be selected. "
-            "Look for options matching the exact flavor or variant in the task "
-            "(e.g., 'honey roasted', 'dark chocolate', 'spearmint'). "
-            "These are clickable options, not just product description words."
+            "Food items often require explicit flavor or variant selection. "
+            "Match the task wording as closely as possible (for example "
+            "'honey roasted' or 'dark chocolate'). Treat them as clickable options, "
+            "not just description text."
         ),
     },
     {
@@ -355,10 +353,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "assortment",
         ],
         "text": (
-            "Food and beauty products often have pack count options like "
-            "'pack of 1', 'pack of 3', '8 ounce (pack of 1)'. "
-            "You MUST click the option matching the quantity or size "
-            "in the task. These are selectable attributes, not just labels."
+            "Food and beauty products often have pack-count options such as "
+            "'pack of 1' or 'pack of 3'. Select the option that matches the required "
+            "quantity and size. These are real attributes, not labels."
         ),
     },
     {
@@ -370,10 +367,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "area", "window", "panel",
         ],
         "text": (
-            "For rugs, curtains, and posters, the page often has dimension "
-            "options like '3x5 feet', '6x9 feet', '16 x 24 in'. "
-            "Select the size option matching the task dimensions. "
-            "If the exact size is not available, pick the closest one."
+            "For rugs, curtains, and posters, pick the dimension option that matches "
+            "the task (for example '3x5 feet' or '16 x 24 in'). "
+            "If the exact size is unavailable, choose the closest one."
         ),
     },
     {
@@ -385,10 +381,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "sweatshirt", "pullover",
         ],
         "text": (
-            "Some product options have code prefixes like '01# black', "
-            "'#3 blue', 'a-04wine', 'v366-pink'. Ignore the code prefix — "
-            "match the COLOR or STYLE name after the code. For example, "
-            "if the task says 'black', click '01# black'."
+            "Some options include code prefixes like '01# black' or 'v366-pink'. "
+            "Ignore the code and match the color or style text after it. "
+            "If the task asks for black, selecting '01# black' is correct."
         ),
     },
     {
@@ -400,10 +395,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "extension", "extender", "dreadlock", "clip",
         ],
         "text": (
-            "If the exact attribute value from the task is not in the "
-            "options list, select the closest available match rather than "
-            "skipping attribute selection entirely. A partial match "
-            "(e.g., 'pink' for 'fuchsia pink') is better than no selection."
+            "If the exact attribute value is not available, choose the closest match "
+            "instead of leaving the attribute unselected. A good partial match "
+            "(for example 'pink' for 'fuchsia pink') is better than no selection."
         ),
     },
 ]
@@ -1718,7 +1712,7 @@ class WebShopHarnessRuntime:
         H5 cold-start: two-layer skill retrieval.
           1. Filter WEBSHOP_SKILLS by task_type tag.
           2. BM25-rank filtered candidates against the raw instruction.
-          3. Return top-k (config.h5_top_k) skills, each capped at max_words.
+          3. Return top-k (config.h5_top_k) skills.
         """
         if not self.config.h5_enabled or self.requirements is None:
             return []
@@ -1729,9 +1723,7 @@ class WebShopHarnessRuntime:
         )
         result = []
         for skill in skills:
-            text = _truncate_to_word_budget(
-                skill["text"], self.config.h5_cold_start_max_words
-            )
+            text = skill["text"]
             result.append({
                 "id": skill["id"],
                 "text": text,

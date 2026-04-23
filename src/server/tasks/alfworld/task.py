@@ -206,48 +206,33 @@ class ALFWorld(Task):
         harness_runtime = None
         if self.harness_config.enabled:
             harness_runtime = ALFWorldHarnessRuntime(self.harness_config)
-        session.inject(ChatCompletionSystemMessageParam(
-            role='system',
-            content=self.get_task_instruction()
-        ))
-
         initial_admissible = info.get('admissible_commands', [[]])[0]
         init_prompt = "Here is your task. " + ob + self.get_available_actions(initial_admissible)
         log_info["init_prompt"] = init_prompt
+        if harness_runtime:
+            # H0: parse task context and seed world model
+            harness_runtime.init_task(init_prompt, initial_admissible)
+
+        # H5 cold-start: gather per-task tips before sending the first system prompt.
+        cold_skills: list = []
+        if harness_runtime and self.harness_config.h5_enabled:
+            cold_skills = harness_runtime.cold_start_skill_hints()
+            for item in cold_skills:
+                log_info["harness_trace"]["h5"].append(item)
+
+        system_prompt = self.get_task_instruction()
+        if cold_skills:
+            skill_lines = "\n".join(f"- {item['text']}" for item in cold_skills)
+            system_prompt += f"\n\nSome tips that may help for this task:\n{skill_lines}"
+
+        session.inject(ChatCompletionSystemMessageParam(
+            role='system',
+            content=system_prompt
+        ))
         session.inject(ChatCompletionUserMessageParam(
             role='user',
             content=init_prompt
         ))
-        if harness_runtime:
-            # H0: parse task context and seed world model
-            harness_runtime.init_task(init_prompt, initial_admissible)
-        if harness_runtime and self.harness_config.h3_enabled and harness_runtime.task_ctx:
-            # H3 per-episode: inject task-type-specific strategy hint now that task_ctx is known.
-            # The class-level tool description patch applies a generic protocol reminder;
-            # this adds the task-specific step sequence (pick_and_place, look_at_obj, etc.)
-            # which was previously unreachable at class init time.
-            h3_task_hint = harness_runtime.build_h3_hint()
-            session.inject(ChatCompletionSystemMessageParam(
-                role='system',
-                content=f"Task strategy: {h3_task_hint}",
-            ))
-            log_info["harness_trace"]["h3"].append({
-                "round": 0,
-                "hint_applied": True,
-                "hint_text": h3_task_hint,
-                "token_cost": len(h3_task_hint.split()),
-            })
-        if harness_runtime and self.harness_config.h5_enabled:
-            # H5 cold-start: task-type-mapped skill hint (replaces BM25 retrieval)
-            cold_skills = harness_runtime.cold_start_skill_hints()
-            if cold_skills:
-                skill_lines = [f"- {item['text']}" for item in cold_skills]
-                session.inject(ChatCompletionUserMessageParam(
-                    role='user',
-                    content="Harness skill hints:\n" + "\n".join(skill_lines),
-                ))
-            for item in cold_skills:
-                log_info["harness_trace"]["h5"].append(item)
 
         # interact
         # Cache admissible commands from the previous env step so they are

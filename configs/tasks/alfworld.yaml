@@ -54,4 +54,3 @@ alfworld-env_train:
     h4: true
     h5: true
     h5_top_k: 1
-
