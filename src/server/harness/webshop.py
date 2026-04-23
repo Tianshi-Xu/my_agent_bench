@@ -270,77 +270,22 @@ _ALL_TASK_TYPES = [
 ]
 
 WEBSHOP_SKILLS: List[Dict[str, Any]] = [
+    # ── Tool-contract skills: non-obvious interface constraints ───────────────
+    # These address behaviors the model cannot infer from tool descriptions or
+    # real-time hints (H3/H4). Strategy skills that duplicate H3 (tool desc)
+    # or H4 (step guidance / attribute checklist) have been removed.
     {
-        "id": "select_all_attributes",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_TECH, TASK_TYPE_HOME],
-        "keywords": [
-            "color", "size", "select", "attribute", "option",
-            "click", "choose", "variant",
-        ],
-        "text": (
-            "On the product page, you MUST select ALL required attributes "
-            "(color, size, style variant) before clicking 'buy now'. "
-            "Check every attribute option on the page. "
-            "Missing even one attribute will result in a wrong purchase."
-        ),
-    },
-    {
-        "id": "brand_match",
+        "id": "price_slightly_over",
         "task_types": _ALL_TASK_TYPES,
         "keywords": [
-            "brand", "model", "specific", "exact", "name",
-            "manufacturer", "maker",
-            # Common instruction phrasing that implies brand-specific search
-            "find", "looking", "need", "want", "help",
+            "price", "budget", "over", "above", "exceed",
+            "expensive", "cost", "afford", "close", "lower", "dollars",
         ],
         "text": (
-            "The task mentions a specific brand or model name. "
-            "On the search results page, carefully read each product title "
-            "and click ONLY the product whose title contains the exact brand name. "
-            "A cheap generic alternative will score zero — brand match is critical."
-        ),
-    },
-    {
-        "id": "verify_product_type",
-        "task_types": [TASK_TYPE_FOOD, TASK_TYPE_BEAUTY, TASK_TYPE_GENERAL],
-        "keywords": [
-            "verify", "check", "confirm", "title", "description",
-            "product", "match", "correct", "right",
-        ],
-        "text": (
-            "Before clicking 'buy now', verify the product title matches the task. "
-            "A product may be cheap and have no attribute options, but still be "
-            "the WRONG product (e.g., shampoo instead of conditioner, "
-            "honey roasted instead of chocolate covered). "
-            "Go back to search if the product type doesn't match."
-        ),
-    },
-    {
-        "id": "search_keywords_strategy",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "search", "keywords", "query", "find", "look",
-            "results", "browse",
-        ],
-        "text": (
-            "When searching, use the product name and key features as keywords. "
-            "Do NOT include price, filler words, or full sentences. "
-            "Example: for 'waterproof blue hiking boots size 10 under $80', "
-            "search 'waterproof blue hiking boots size 10'. "
-            "If first search yields no match, try shorter or different keywords."
-        ),
-    },
-    {
-        "id": "buy_immediately_after_attrs",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "buy", "purchase", "complete", "done", "finish",
-            "buy now", "checkout", "immediately",
-        ],
-        "text": (
-            "After selecting all required attributes, click 'buy now' IMMEDIATELY. "
-            "Do NOT deliberate, explain your reasoning, or confirm — just buy. "
-            "Every turn spent NOT buying wastes your limited step budget."
+            "If a product is slightly above budget (within ~5%), buy it anyway — "
+            "a close match is better than no purchase. Do not waste turns searching "
+            "for a cheaper alternative that may not exist. "
+            "Only skip products that are significantly over budget (>20%)."
         ),
     },
     {
@@ -349,13 +294,15 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
         "keywords": [
             "light", "dark", "sky", "navy", "rose", "baby",
             "royal", "hot", "deep", "bright", "pale", "neon",
-            "blue", "green", "pink", "grey", "gray", "gold",
+            "fuchsia", "dusty", "salmon", "pearl", "champagne",
+            "wine", "maroon", "turquoise", "teal", "coral", "burgundy",
+            "charcoal", "aqua", "blue", "green", "pink", "grey", "gray", "gold",
         ],
         "text": (
-            "For compound colors like 'light blue', 'rose pink', 'sky blue', "
-            "'dark green': look for the FULL compound color option on the page. "
+            "For compound colors like 'light blue', 'fuchsia pink', 'sky blue': "
+            "look for the FULL compound color option on the page first. "
             "If only a partial match exists (e.g., 'blue' when you need 'light blue'), "
-            "click the closest match — it may still score well."
+            "click the closest partial match — do NOT skip color selection."
         ),
     },
     {
@@ -397,95 +344,6 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "Look for options matching the exact flavor or variant in the task "
             "(e.g., 'honey roasted', 'dark chocolate', 'spearmint'). "
             "These are clickable options, not just product description words."
-        ),
-    },
-    {
-        "id": "pagination_exploration",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "next", "page", "browse", "more", "results",
-            "scroll", "search", "again",
-        ],
-        "text": (
-            "If no product on the current search results page matches the task, "
-            "click 'next >' to see more results before re-searching. "
-            "The correct product may be on page 2 or 3."
-        ),
-    },
-    # ── Skills targeting agent behavioral failure patterns ─────────────────
-    {
-        "id": "back_to_search_on_mismatch",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "back", "search", "wrong", "mismatch", "different",
-            "return", "try", "another",
-        ],
-        "text": (
-            "If the product page title does NOT match the task description "
-            "(wrong product type, wrong brand, wrong category), "
-            "click 'back to search' IMMEDIATELY. Do not deliberate or explain — "
-            "just click 'back to search' and try a different product. "
-            "Search is NOT available on product pages; only 'back to search' works."
-        ),
-    },
-    {
-        "id": "no_repeat_after_selected",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_TECH, TASK_TYPE_HOME],
-        "keywords": [
-            "already", "selected", "repeat", "again", "same",
-            "clicked", "chosen", "done",
-        ],
-        "text": (
-            "Once you have selected an attribute (color, size, etc.) and the hint "
-            "confirms '[selected ✓]', do NOT click it again. "
-            "Move on to the next unselected attribute, or click 'buy now' if all "
-            "attributes are done."
-        ),
-    },
-    {
-        "id": "price_slightly_over",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "price", "budget", "over", "above", "exceed",
-            "expensive", "cost", "afford", "close",
-        ],
-        "text": (
-            "If a product is slightly above budget (within ~5%), buy it anyway — "
-            "a close match is better than no purchase. Do not waste turns searching "
-            "for a cheaper alternative that may not exist. "
-            "Only skip products that are significantly over budget (>20%)."
-        ),
-    },
-    {
-        "id": "read_search_titles_carefully",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "title", "name", "read", "careful", "match",
-            "product", "select", "results", "correct",
-        ],
-        "text": (
-            "On the search results page, carefully read EVERY product title before clicking. "
-            "Choose the product whose title contains the most keywords from the task "
-            "(brand name, product type, key features). "
-            "Do NOT just click the first or cheapest product — title match is more "
-            "important than price."
-        ),
-    },
-    # ── v10 skills: specific, actionable patterns ──────────────────────────
-    {
-        "id": "multi_word_color_match",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_HOME, TASK_TYPE_BEAUTY],
-        "keywords": [
-            "fuchsia", "sky", "navy", "royal", "baby", "hot",
-            "deep", "bright", "pale", "neon", "dusty", "salmon",
-            "pearl", "champagne", "wine", "maroon", "turquoise",
-            "teal", "coral", "burgundy", "charcoal", "aqua",
-        ],
-        "text": (
-            "If the task asks for a compound color like 'fuchsia pink' or "
-            "'sky blue' but the page only has 'pink' or 'blue', click the "
-            "partial match — it is the closest option. Do not skip color "
-            "selection just because the exact compound color isn't listed."
         ),
     },
     {
@@ -1378,15 +1236,15 @@ def _rank_search_results(
     scored.sort(key=lambda x: (x["price_ok"], x["score"]), reverse=True)
 
     best = scored[0]
-    if best["score"] == 0:
-        return None  # no keyword match, don't suggest
+    # Require at least 2 distinct task keywords to match before suggesting.
+    # A single-keyword match (e.g. only "moisturizer" for "buttercream scent
+    # moisturizer") is too weak to reliably identify the right product.
+    if best["score"] < 2:
+        return None
 
-    # Build suggestion
-    overlap_str = ", ".join(sorted(best["overlap"])[:5])
-    suggestion = (
-        f"Best match: click '{best['asin']}' — "
-        f"title matches [{overlap_str}]"
-    )
+    # Include the product title so the agent can verify the suggestion is correct.
+    title_preview = best["title"][:60].strip() if best["title"] else best["asin"]
+    suggestion = f"Best match on this page: '{title_preview}' — click '{best['asin']}'"
     if not best["price_ok"]:
         suggestion += " (WARNING: may exceed budget)"
 
@@ -1478,11 +1336,14 @@ def _product_title_check(
     overlap_ratio = overlap_count / len(item_nouns)
 
     # item_nouns is sorted longest-first, so item_nouns[0] is the most specific noun.
-    # Require it to be present (primary noun check) OR 40% overall overlap.
-    # This catches cases where a product page mentions a few generic task words
-    # (e.g. "home", "decor") but not the actual product category noun ("rug", "curtain").
+    # Warn only when BOTH conditions hold:
+    #   - primary noun (longest, most discriminative) is missing, AND
+    #   - overall overlap is below 50% (more than half the item nouns are missing).
+    # Using AND prevents false positives where the task phrase has multiple content
+    # words but the correct product page is missing one (e.g. "batteries remote control
+    # for tv" → a TV remote may lack "batteries" but has "remote" + "control" → 0.67).
     primary_noun_found = item_nouns[0] in product_portion
-    if not primary_noun_found or overlap_ratio < 0.40:
+    if not primary_noun_found and overlap_ratio < 0.50:
         missing = [w for w in item_nouns if w not in product_portion][:3]
         return (
             f"Harness: this product may not match the task category. "

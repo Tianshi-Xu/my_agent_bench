@@ -13,5 +13,5 @@ assignments:
     task:
       - dbbench-env_train
 
-output: "outputs/dbbench/{TIMESTAMP}"
-trials: 5
+output: "outputs/dbbench/{TIMESTAMP}-harness"
+trials: 1

@@ -2,7 +2,7 @@ import: definition.yaml
 
 concurrency:
   task:
-    alfworld-env_train: 16
+    alfworld-env_train: 32
     alfworld-std: 32
   agent:
     qwen3-4b-instruct: 32
@@ -11,9 +11,9 @@ assignments:
   - agent:
       - qwen3-4b-instruct
     task:
-      - alfworld-std
-      # - alfworld-env_train
+      # - alfworld-std
+      - alfworld-env_train
 
-output: "outputs/alfworld/{TIMESTAMP}-no-h5"
+output: "outputs/alfworld/{TIMESTAMP}-harness"
 
 trials: 1

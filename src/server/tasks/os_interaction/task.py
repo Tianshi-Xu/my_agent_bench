@@ -182,7 +182,7 @@ class OSInteraction(Task):
         if self.harness_config.enabled and self.harness_config.h3_enabled:
             tools = patch_os_tool_descriptions(tools)
 
-        super().__init__(**kwargs)
+        super().__init__(tools=tools, **kwargs)
         self.round_limit: int = round_limit
         self.data_config = data_config
         self.docker_config = docker_config
@@ -747,23 +747,11 @@ Always use a tool provided instead of simply responding with content."""
                 # so rescue failed, give specific feedback to break the loop.
                 if _content_has_xml_tool_call:
                     nudge = (
-                        "Harness: your <tool_call> XML was truncated or malformed and "
-                        "could not be parsed. Do NOT write tool calls as XML text — "
-                        "use the function calling API directly. Call bash_action or "
-                        "answer_action as a proper function call (not as text)."
+                        "Harness: your response did not contain a valid tool call. "
+                        "Please use the function calling API to call a tool."
                     )
                 else:
-                    nudge = "No executable tool calls found. Please call a tool instead"
-                    if (
-                        harness_runtime is not None
-                        and self.harness_config.h4_enabled
-                        and harness_runtime.state.text_only_streak >= self.harness_config.h2_text_only_streak_force
-                    ):
-                        nudge += (
-                            " — you MUST invoke a function. Never write `answer_action(...)` "
-                            "or `bash_action(...)` as plain text. If you already have the "
-                            "answer, call answer_action with just the value."
-                        )
+                    nudge = "No tool call detected. Please call a tool."
                 session.inject(ChatCompletionUserMessageParam(
                     role='user',
                     content=nudge,

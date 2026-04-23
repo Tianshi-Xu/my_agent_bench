@@ -44,7 +44,7 @@ alfworld-env_train:
   parameters:
     name: alfworld-env_train
     split: "train_valid"
-    shuffle_seed: 42
+    shuffle_seed: 43
     start: 0
     end: 3000
     sample_size: 100
@@ -53,5 +53,5 @@ alfworld-env_train:
     h3: true
     h4: true
     h5: true
-    h5_top_k: 2
+    h5_top_k: 1
 

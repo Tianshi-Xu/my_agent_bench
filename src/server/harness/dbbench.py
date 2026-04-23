@@ -634,6 +634,9 @@ def _detect_answer_shape(task_type: str, description: str) -> Optional[str]:
     if task_type in _MUTATION_TYPES:
         return SHAPE_HASH
     if task_type == TASK_COUNTING or task_type == TASK_AGG_COUNT:
+        # "how many X of each Y" / "for each Y" → GROUP BY → multi-row answer
+        if re.search(r"\bfor each\b|\bof each\b|\bper \w+\b|\bgrouped? by\b", t):
+            return SHAPE_MULTI_MULTI
         return SHAPE_SCALAR_INT
     if task_type == TASK_AGG_SUM or task_type == TASK_AGG_AVG:
         return SHAPE_SCALAR_FLOAT
@@ -834,6 +837,7 @@ class DBSessionState:
     mutation_commit_blocks_used: int = 0
     scalar_multi_answer_blocks_used: int = 0  # dedicated counter for scalar>1 blocks
     last_result_col_count: Optional[int] = None  # column count of last multi-col result
+    last_result_row_count: Optional[int] = None  # row count of last SQL result
     h4_fired_last_round: bool = False
 
 
@@ -1352,10 +1356,14 @@ def extract_candidate_from_response(response: str, answer_shape: Optional[str]) 
                     # the candidate (evaluator maps None → "0").
                     return "0", True
                 return str(v), False
-            # Multi-row but shape says scalar → take the first cell but mark implausible.
+            # Multi-row but shape says scalar → take the first cell.
+            # Only flag implausible when the agent returned MULTIPLE rows for a
+            # scalar-shape task; a single-row multi-col result is an exploratory
+            # query and should not trigger the "multi-row returned" H4 warning.
             try:
                 first_cell = parsed[0][0] if isinstance(parsed[0], tuple) else parsed[0]
-                return str(first_cell), True
+                is_implausible = len(parsed) > 1
+                return str(first_cell), is_implausible
             except Exception:
                 return None, False
 
@@ -1410,10 +1418,11 @@ _H3_SYSTEM_APPEND = (
     "backticks. A syntax error near a column name is almost always an "
     "un-backticked identifier. "
     "IMPORTANT: ALL columns are stored as TEXT — there are no INT/FLOAT columns. "
-    "For INSERT/UPDATE, values must be quoted strings that EXACTLY match the "
-    "existing data format (including units like '100.0 m.', ordinals like '2nd', "
-    "date strings like 'October 23, 2005'). Check the sample rows in the schema "
-    "card to see the expected format before writing INSERT/UPDATE statements."
+    "For INSERT/UPDATE, values must be quoted strings. Check the sample rows in "
+    "the schema card to determine the correct format for units (e.g. '100.0 m.'), "
+    "ordinals (e.g. '2nd'), and dates (e.g. 'October 23, 2005'). For pure numeric "
+    "values, use plain digits without thousands separators unless the sample rows "
+    "explicitly show commas (e.g. use '63000' not '63,000')."
 )
 
 
@@ -1859,6 +1868,7 @@ class DBBenchHarnessRuntime:
                     parsed_r = eval(resp_s, {"__builtins__": {}}, {})
                     if isinstance(parsed_r, list) and parsed_r and isinstance(parsed_r[0], tuple):
                         self.state.last_result_col_count = len(parsed_r[0])
+                        self.state.last_result_row_count = len(parsed_r)
                 except Exception:
                     pass
 
@@ -2152,14 +2162,16 @@ class DBBenchHarnessRuntime:
             and not st.candidate_implausible
             and st.sql_history
         ):
-            preview = str(st.candidate_answer)[:60]
             if ctx.answer_shape == SHAPE_MULTI_MULTI and st.last_result_col_count and st.last_result_col_count > 1:
+                row_note = f"{st.last_result_row_count} rows " if st.last_result_row_count else "rows "
                 hint = (
-                    f"Harness hint: last query returned `{preview}`. "
-                    f"Submit each ROW as one element (tuple repr): "
-                    f"answers=[\"('v1','v2')\", …]. Call commit_final_answer now."
+                    f"Harness hint: last query returned {row_note}with "
+                    f"{st.last_result_col_count} columns. Submit ALL rows — each as "
+                    f"one tuple-repr element: answers=[\"('v1','v2')\", …]. "
+                    f"Call commit_final_answer now."
                 )
             else:
+                preview = str(st.candidate_answer)[:60]
                 hint = (
                     f"Harness hint: last successful query returned `{preview}`. "
                     f"Submit the bare value(s) — no tuple brackets. "
@@ -2203,9 +2215,8 @@ class DBBenchHarnessRuntime:
                 and ctx.answer_shape in (SHAPE_SCALAR_INT, SHAPE_SCALAR_FLOAT, SHAPE_SCALAR_STR)
             ):
                 hint = (
-                    "Harness: multi-row returned but task expects a single value. "
-                    "Use COUNT(*), MAX/MIN, or add a more specific WHERE / LIMIT 1. "
-                    "Do NOT GROUP BY when a global total is expected."
+                    "Harness: multiple rows returned but task expects a single value. "
+                    "Use COUNT(*), MAX/MIN, or add a more specific WHERE / LIMIT 1."
                 )
 
         if hint is None:

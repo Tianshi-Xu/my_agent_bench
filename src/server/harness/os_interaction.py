@@ -345,18 +345,8 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "task_types": _ALL_TASK_TYPES,
         "keywords": ["answer", "format", "number", "count", "output"],
         "text": (
-            "When submitting the answer, call the `answer_action` tool with ONLY "
-            "the bare value (e.g. '5', not '5 files' or 'The answer is 5'). "
+            "Submit only the bare value (e.g. '5', not '5 files' or 'The answer is 5'). "
             "Counting tasks expect a plain integer."
-        ),
-    },
-    {
-        "id": "avoid_text_tool_calls",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": ["tool", "call", "finish", "answer", "submit"],
-        "text": (
-            "NEVER write `answer_action(...)` or `bash_action(...)` in plain text — "
-            "you MUST invoke the tool via a real function call. Plain text is rejected."
         ),
     },
     {
@@ -365,7 +355,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "keywords": ["already", "have", "answer", "submit", "result"],
         "text": (
             "If the last bash output already contains your answer, do NOT re-run "
-            "the same command — call `answer_action` with the value immediately."
+            "the same command — submit your final answer immediately."
         ),
     },
     {
@@ -375,6 +365,26 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "If output is truncated, refine the command — add `| wc -l`, "
             "`| head -20`, or a narrower filter. Do NOT re-run the same command."
+        ),
+    },
+    {
+        "id": "grep_bracket_word_bug",
+        "task_types": _ALL_TASK_TYPES,
+        "keywords": ["error", "warning", "info", "debug", "pattern", "match", "word", "contain"],
+        "text": (
+            "Regex pitfall: `grep '[ERROR]'` is a character class matching E, R, or O — "
+            "NOT the word 'ERROR'. To match the literal string use `grep 'ERROR'` (no brackets). "
+            "Same applies to [WARNING], [INFO], [DEBUG] etc."
+        ),
+    },
+    {
+        "id": "today_date_command",
+        "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES, TASK_COUNT_UNIQUE, TASK_COUNT_FILES],
+        "keywords": ["today", "current date", "this day", "date"],
+        "text": (
+            "When the task says 'today', get the actual date with `date +%Y-%m-%d` and use it in "
+            "your grep: `grep \"$(date +%Y-%m-%d)\" FILE | ...`. "
+            "Do NOT hardcode a date from the log file — that may be the wrong day."
         ),
     },
     # ── v2 specialised skills (added after 2026-04-18 eval) ──────────────────
@@ -482,21 +492,21 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE],
         "keywords": ["home", "txt", "text", "files", "home directory", "glob"],
         "text": (
-            "Never use `~/.*\\.EXT` regex in bash — shell glob expansion does not "
-            "work that way and produces 'No such file or directory'. "
-            "Instead: `find ~ -maxdepth 1 -name '*.EXT'` or "
-            "`grep -r --include='*.EXT' PATTERN ~`."
+            "Never use `~/.*\\.EXT` glob in bash — it produces 'No such file or directory'. "
+            "Use `find DIR -name '*.EXT'` instead, where DIR is the target path. "
+            "If the task specifies a subdirectory (e.g. '~/project_files'), use that full path — "
+            "NOT just `~` or `find ~ -maxdepth 1`."
         ),
     },
     {
         "id": "ip_status_extract",
         "task_types": [TASK_COUNT_UNIQUE],
-        "keywords": ["ip", "address", "status", "200", "404", "access", "unique", "log"],
+        "keywords": ["access", "http", "apache", "nginx", "web", "status", "200", "404", "request"],
         "text": (
-            "To count unique IPs with a specific HTTP status code: "
-            "`awk '$9==\"200\"{print $1}' FILE | sort -u | wc -l`. "
-            "Do NOT extract IPs first then grep for the status code — the status "
-            "code is NOT in the IP string, so that grep always returns 0."
+            "For HTTP access logs: count unique IPs with status code N: "
+            "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`. "
+            "For SSH/auth logs: `grep 'Failed password' /var/log/auth.log | awk '{print $11}' | sort -u | wc -l`. "
+            "Do NOT grep for the status code after extracting IPs — the status code is in a different field."
         ),
     },
 ]
@@ -628,6 +638,13 @@ def _detect_task_type(desc: str) -> str:
     if re.search(r"\bcontain(?:ing)?\b|\bmatch(?:ing)?\b", t) and re.search(r"\bcount|number\s+of|how\s+many\b", t):
         return TASK_COUNT_MATCHES
     if re.search(r"\bcount\b|\bnumber\s+of\b|\bhow\s+many\b", t) and re.search(r"\bfiles?\b|\bdirector(?:y|ies)\b|\bfolders?\b", t):
+        # "count entries/occurrences/errors in files" → TASK_COUNT_MATCHES, not TASK_COUNT_FILES
+        if re.search(
+            r"\bentries?\b|\boccurrences?\b|\binstances?\b|\blines?\b"
+            r"|\berrors?\b|\bwarnings?\b|\blevel\b|\blog\s+entries?\b",
+            t,
+        ):
+            return TASK_COUNT_MATCHES
         return TASK_COUNT_FILES
     # List / read
     if re.search(r"\blist\b.*\bfiles?\b", t):
@@ -772,6 +789,8 @@ class OSShellState:
     # v5: True when the previous round's post_step_monitor returned a recovery_prompt.
     # Used by the post-ls nudge to detect "H4 fired → agent ran ls → files found" pattern.
     h4_fired_last_round: bool = False
+    # Cumulative count of bash_loop detections (resets per episode via dataclass init).
+    bash_loop_count: int = 0
 
 
 _NUMERIC_LINE_RE = re.compile(r"^\s*(-?\d+)\s*$")
@@ -859,6 +878,19 @@ def bash_semantic_gaps(ctx: "OSTaskContext", bash: str) -> List[str]:
     # -type f missing on count_files
     if ctx.task_type == TASK_COUNT_FILES and "find" in b and "-type f" not in b and "-type d" not in b:
         gaps.append("counting files — add `-type f` to exclude directories from the count")
+    # [WORD] character-class bug: grep '[ERROR]' matches single chars E/R/O, not the word
+    _bracket_word = re.search(r"grep\b[^|]*\[([A-Za-z]{2,})\]", bash)
+    if _bracket_word:
+        gaps.append(
+            f"'[{_bracket_word.group(1)}]' is a regex character class, not the word "
+            f"'{_bracket_word.group(1)}' — use `grep '{_bracket_word.group(1)}'` (no brackets)"
+        )
+    # xargs grep -r antipattern: -r makes grep recursive on file args from xargs — usually wrong
+    if "xargs" in b and re.search(r"grep\s+(?:-[a-zA-Z]*r[a-zA-Z]*\s|.*\s-r\b)", bash):
+        gaps.append(
+            "avoid `xargs grep -r` — xargs passes filenames so `-r` recurses inside each file path; "
+            "use `xargs grep` (no -r) or `grep -r PATTERN DIR` directly"
+        )
     return gaps
 
 
@@ -902,10 +934,10 @@ def extract_numeric_candidates(text: str) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _H3_BASH_HINT = (
-    "Prefer one concise pipeline per turn. For counting files, use "
-    "`find DIR -type f ... | wc -l` (add `-type f` to exclude directories). "
-    "For counting unique values, pipe to `sort -u | wc -l`. "
-    "For matching lines, prefer `grep -c PATTERN FILE`."
+    "Use targeted, readable commands — break complex logic into multiple turns. "
+    "For counting files: `find DIR -type f -name '*.EXT' | wc -l` (always add `-type f`). "
+    "For counting matching lines: `grep -rh PATTERN DIR | wc -l`. "
+    "For unique values: pipe to `sort -u | wc -l`."
 )
 
 _H3_ANSWER_HINT = (
@@ -952,12 +984,12 @@ _RESCUE_ANSWER_JSON_RE = re.compile(
 # Python-kwarg style: answer_action(answer='5') / answer_action(answer="5") — the
 # dominant failure mode on Qwen3-4B-Instruct (38/43 fails in 2026-04-18 eval).
 _RESCUE_ANSWER_KWARG_RE = re.compile(
-    r"answer_action\s*\(\s*answer\s*=\s*['\"]?([A-Za-z0-9_.+\-/]+?)['\"]?\s*\)",
+    r"answer_action\s*\(\s*answer\s*=\s*(?:['\"]([^'\"]{1,200})['\"]|([^\)\n]{1,120}))\s*\)",
     re.IGNORECASE,
 )
 # Positional form: answer_action(5) / answer_action('42.5MB') / answer_action("foo")
 _RESCUE_ANSWER_POSITIONAL_RE = re.compile(
-    r"answer_action\s*\(\s*['\"]?([A-Za-z0-9_.+\-/]{1,60})['\"]?\s*\)",
+    r"answer_action\s*\(\s*(?:['\"]([^'\"]{1,200})['\"]|([^\)\n]{1,120}))\s*\)",
     re.IGNORECASE,
 )
 # Bare "answer_action 60" (no parens) — only match a tight line-final token so
@@ -986,10 +1018,29 @@ _RESCUE_FINISH_KWARG_RE = re.compile(
 _REACT_ANSWER_RE = re.compile(r"Act:\s*answer\s*\(([^)]+)\)", re.IGNORECASE)
 _REACT_BASH_FENCE = re.compile(r"```bash\n(.*?)\n```", re.DOTALL)
 # Qwen3 OpenAI-JSON style: <tool_call>\n{"name":"bash_action","arguments":{...}}\n</tool_call>
+# MUST be greedy (.*) — the outer JSON has nested dicts (}} at the end), so non-greedy
+# .*? stops at the first } (inner dict) and produces incomplete JSON that json.loads rejects.
 _RESCUE_TOOL_CALL_XML_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    r"<tool_call>\s*(\{.*\})\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
+# Qwen3 writes bash grouping \( \) inside JSON strings, which is invalid JSON.
+# Convert invalid \X to \\X so json.loads sees a valid escaped backslash, and
+# the resulting parsed string retains \( as correct bash syntax.
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
+
+
+def _fix_json_escapes(s: str) -> str:
+    """Convert invalid JSON escapes (e.g. backslash-paren) to double-backslash form."""
+    return _INVALID_JSON_ESCAPE_RE.sub(r'\\\\\1', s)
+
+
+def _first_nonempty_match_group(m: re.Match) -> str:
+    """Return the first non-empty capture group from a regex match."""
+    for g in m.groups():
+        if g is not None and g != "":
+            return g
+    return m.group(0)
 
 
 def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
@@ -1009,7 +1060,7 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
     if m:
         try:
             import json as _json
-            obj = _json.loads(m.group(1))
+            obj = _json.loads(_fix_json_escapes(m.group(1)))
             name = obj.get("name", "")
             args = obj.get("arguments", {})
             if name in ("answer_action", "bash_action", "finish_action") and args:
@@ -1021,7 +1072,7 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
                 _RESCUE_ANSWER_POSITIONAL_RE, _RESCUE_ANSWER_BARE_RE):
         m = pat.search(content)
         if m:
-            val = m.group(1).strip().strip("'\"")
+            val = _first_nonempty_match_group(m).strip().strip("'\"")
             # Defend against picking up the literal token "answer" / "action"
             if val.lower() in {"answer", "action", "value"}:
                 continue
@@ -1173,17 +1224,6 @@ class OSHarnessRuntime:
             query=self.task_ctx.raw_description,
             top_k=self.config.h5_top_k,
         )
-        # Always include the "avoid_text_tool_calls" skill if space remains —
-        # it's the highest-leverage skill against the dominant failure mode.
-        forced_id = "avoid_text_tool_calls"
-        have_ids = {s["id"] for s in skills}
-        if forced_id not in have_ids:
-            forced = next((s for s in OS_SKILLS if s["id"] == forced_id), None)
-            if forced is not None:
-                if len(skills) >= self.config.h5_top_k:
-                    skills = skills[: self.config.h5_top_k - 1] + [forced]
-                else:
-                    skills = skills + [forced]
         result: List[Dict[str, str]] = []
         for skill in skills:
             text = _truncate_to_word_budget(
@@ -1412,11 +1452,21 @@ class OSHarnessRuntime:
                 response["recovery_prompt"] = (
                     f"Harness: you have run the same command {self.config.h4_stall_window} times. "
                     f"The output already contains the answer ({st.candidate_numeric_answer}). "
-                    f"Call answer_action(answer='{st.candidate_numeric_answer}') now."
+                    f"Stop repeating — submit your final answer now."
                 )
             else:
+                st.bash_loop_count += 1
                 alt = self._first_turn_hint(ctx)
-                if alt:
+                # After 2+ loop detections with no candidate, force finish to break deadlock
+                if st.bash_loop_count >= 2:
+                    response["force_action"] = {
+                        "name": "finish_action",
+                        "arguments": {"thought": "Harness forced finish after repeated loop with no answer found."},
+                    }
+                    response["recovery_prompt"] = (
+                        "Harness: repeated loop detected with no answer. Terminating episode."
+                    )
+                elif alt:
                     response["recovery_prompt"] = (
                         "Harness: you are repeating the same command with no progress. "
                         "Try this instead — " + alt.removeprefix("Hint: ")
@@ -1424,7 +1474,7 @@ class OSHarnessRuntime:
                 else:
                     response["recovery_prompt"] = (
                         "Harness: you are repeating the same command. Try a different approach "
-                        "or submit the best answer you have with answer_action."
+                        "or submit the best answer you have."
                     )
             return _return(response)
 
@@ -1432,9 +1482,8 @@ class OSHarnessRuntime:
         if st.text_only_streak >= self.config.h2_text_only_streak_force:
             response["audit_reason"] = "text_only_streak"
             response["recovery_prompt"] = (
-                "Harness: you must call a tool. If you already have the answer, "
-                "call answer_action with just the value. Never embed "
-                "`answer_action(...)` in plain text — invoke the function."
+                "Harness: no tool call was detected. "
+                "You must call a tool — either run a bash command or submit your final answer."
             )
             return _return(response)
 
@@ -1501,8 +1550,8 @@ class OSHarnessRuntime:
                     and not st.candidate_implausible
                 ):
                     response["recovery_prompt"] = (
-                        f"[{rem} rounds left] Submit now: "
-                        f"answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"[{rem} rounds left] You have a candidate answer "
+                        f"({st.candidate_numeric_answer}). Submit it now."
                     )
                 elif st.candidate_implausible:
                     response["recovery_prompt"] = (
@@ -1512,7 +1561,7 @@ class OSHarnessRuntime:
                 else:
                     response["recovery_prompt"] = (
                         f"[{rem} rounds left] If you have a candidate answer, "
-                        "submit it immediately via answer_action."
+                        "submit it immediately."
                     )
 
         return _return(response)
@@ -1584,21 +1633,20 @@ class OSHarnessRuntime:
                         "Harness: result is 0. Before submitting, verify your path "
                         "and filter are correct — run `ls` on the target directory to "
                         "confirm it exists and has the expected files. "
-                        "If the answer truly is 0, call answer_action(answer='0')."
+                        "If the answer truly is 0, submit it."
                     )
                 elif round_num == 0 and len(st.bash_history) == 1:
-                    # First bash — ask the agent to verify before submitting.
+                    # First bash — push for verification rather than immediate submission.
                     hint = (
-                        f"Hint: you got '{st.candidate_numeric_answer}' from your first bash "
-                        f"command. Before submitting, re-read the task carefully and verify: "
-                        f"right directory? correct pattern? lines vs files? case-sensitive? "
-                        f"If confident, call answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"Hint: your first command returned '{st.candidate_numeric_answer}'. "
+                        f"Verify before committing: right directory? correct filter pattern? "
+                        f"case-sensitive match? counting lines not files? "
+                        f"Run a second command to confirm if unsure."
                     )
                 else:
                     hint = (
                         f"Hint: the last output contains the likely answer "
-                        f"'{st.candidate_numeric_answer}'. If that matches the task, call "
-                        f"answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"'{st.candidate_numeric_answer}'. If that matches the task, submit it."
                     )
             # Suspicious-zero nudge when the candidate IS implausible
             elif hint is None and (
@@ -1622,8 +1670,7 @@ class OSHarnessRuntime:
                 and not st.last_output_had_error
             ):
                 hint = (
-                    f"Hint: if '{st.candidate_string_answer}' is the answer, call "
-                    f"answer_action(answer='{st.candidate_string_answer}')."
+                    f"Hint: if '{st.candidate_string_answer}' is the answer, submit it."
                 )
 
         # First-turn suggestion when no bash has been run yet (always allowed)

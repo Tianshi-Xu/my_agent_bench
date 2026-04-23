@@ -240,6 +240,24 @@ _SEARCH_PRIORITY: Dict[str, List[str]] = {
     "dishsponge":  ["sinkbasin", "cabinet", "countertop"],
     "glassbottle": ["cabinet", "countertop", "fridge"],
     "remotecontrol": ["sofa", "sidetable", "coffeetable", "ottoman"],
+    # Bedroom / living room objects missing from original list
+    "pillow":       ["bed", "sofa", "armchair", "ottoman", "sidetable"],
+    "vase":         ["shelf", "sidetable", "diningtable", "coffeetable"],
+    "laptop":       ["desk", "sidetable", "coffeetable"],
+    "watch":        ["sidetable", "drawer", "desk"],
+    "statue":       ["shelf", "sidetable", "diningtable"],
+    "candle":       ["sidetable", "shelf", "diningtable"],
+    "tissuebox":    ["sidetable", "coffeetable", "shelf", "countertop"],
+    "spraybottle":  ["cabinet", "countertop", "bathtubbasin"],
+    "ladle":        ["drawer", "countertop", "cabinet"],
+    "peppershaker": ["countertop", "cabinet", "diningtable"],
+    "saltshaker":   ["countertop", "cabinet", "diningtable"],
+    "scrubbrush":   ["sinkbasin", "bathtubbasin", "cabinet"],
+    "box":          ["shelf", "cabinet", "desk", "sidetable"],
+    "alarmclock":   ["sidetable", "desk", "shelf"],
+    "baseball":     ["desk", "shelf", "ottoman", "sidetable"],
+    "basketball":   ["ottoman", "sofa", "shelf"],
+    "tennisracket": ["shelf", "ottoman", "sidetable"],
 }
 _SEARCH_PRIORITY_DEFAULT = [
     "countertop", "cabinet", "shelf", "drawer",
@@ -424,16 +442,29 @@ class WorldModel:
                 if loc not in self.visited and loc not in self.unvisited:
                     self.unvisited.append(loc)
 
+    # Locations that are very unlikely to contain any useful item.
+    # Kept as absolute last resort for navigation hints.
+    _DEPRIORITIZED_LOCS = ("garbagecan", "bathtubbasin", "toiletpaperhangerbox")
+
     def ordered_unvisited(self, target_type: str) -> List[str]:
-        """Unvisited locations sorted by commonsense priority for target_type."""
+        """Unvisited locations sorted by commonsense priority for target_type.
+
+        Locations that are extremely unlikely to contain any household item
+        (garbagecan, bathtubbasin) are ranked last so navigation hints
+        never suggest them unless no other option remains.
+        """
         priority = _SEARCH_PRIORITY.get(target_type.lower(), _SEARCH_PRIORITY_DEFAULT)
+        n_priority = len(priority)
 
         def rank(loc: str) -> int:
             ll = loc.lower()
             for i, p in enumerate(priority):
                 if ll.startswith(p):
                     return i
-            return len(priority)
+            # Push deprioritized locations past everything else
+            if any(ll.startswith(d) for d in WorldModel._DEPRIORITIZED_LOCS):
+                return n_priority + 100
+            return n_priority
 
         return sorted(self.unvisited, key=rank)
 
@@ -570,6 +601,18 @@ def _pick_forced_action(admissible: List[str], last_output: str) -> Optional[str
             continue
         return action
     return admissible[0] if admissible else None
+
+
+# H5 tool-contract mapping (module-level so it can't conflict with dataclass fields).
+# Maps task_type → the single tool-contract skill id to inject at cold-start.
+# Only task types with a non-obvious interface constraint are listed here.
+# pick_and_place / pick_two_obj are omitted on purpose: H3 + H4 are sufficient.
+_H5_CONTRACT_MAP: Dict[str, str] = {
+    "pick_clean_then_place": "take_before_visiting_appliance",
+    "pick_heat_then_place":  "take_before_visiting_appliance",
+    "pick_cool_then_place":  "take_before_visiting_appliance",
+    "look_at_obj":           "examine_plain_is_useless",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -726,13 +769,15 @@ class ALFWorldHarnessRuntime:
                 "Always call take_action with exactly one action from AVAILABLE ACTIONS.",
                 self.config.h3_max_words,
             )
+        tt = self.task_ctx.target_type or "target"
+        dt = self.task_ctx.destination_type or "destination"
         hints = {
-            "pick_and_place":        "Prioritize: locate target → take → navigate to destination → put.",
-            "pick_two_obj":          "You can carry one item at a time. Deliver first, then collect second.",
-            "pick_clean_then_place": "Locate target → take → go to sinkbasin → clean → go to destination → put.",
-            "pick_heat_then_place":  "Locate target → take → go to microwave → heat → go to destination → put.",
-            "pick_cool_then_place":  "Locate target → take → go to fridge → cool → go to destination → put.",
-            "look_at_obj":           "Go to desklamp → use it → find target object → take it → examine with desklamp.",
+            "pick_and_place":        f"Find the {tt} → take it → go to {dt} → put it there.",
+            "pick_two_obj":          f"Carry one {tt} at a time. Put it in {dt}, then find the second {tt}.",
+            "pick_clean_then_place": f"Find the {tt} → take it → go to sinkbasin → clean it → go to {dt} → put it.",
+            "pick_heat_then_place":  f"Find the {tt} → take it → go to microwave → heat it → go to {dt} → put it.",
+            "pick_cool_then_place":  f"Find the {tt} → take it → go to fridge → cool it → go to {dt} → put it.",
+            "look_at_obj":           f"Find the desklamp → turn it on → find the {tt} → take it → examine {tt} with desklamp.",
         }
         hint = hints.get(self.task_ctx.task_type, hints["pick_and_place"])
         return _truncate_to_word_budget(hint, self.config.h3_max_words)
@@ -1086,28 +1131,28 @@ class ALFWorldHarnessRuntime:
 
     def cold_start_skill_hints(self) -> List[Dict[str, str]]:
         """
-        H5 cold-start: two-layer retrieval.
-          1. Filter ALF_SKILLS by task_type tag.
-          2. BM25-rank filtered candidates against the task goal string.
-          3. Return top-k (config.h5_top_k) skills, each capped at max_words.
+        H5 cold-start: inject one tool-contract skill for task types where the
+        model has a known interface-contract blind spot.
+
+        Design principle: H5 is PREVENTIVE (front-loads non-obvious constraints
+        before the agent can fail), not DUPLICATIVE (strategy already in H3/H4).
+        Only task types with a genuinely non-obvious action precondition get an
+        injection; simple placement tasks do not.
         """
         if not self.config.h5_enabled or self.task_ctx is None:
             return []
-        skills = retrieve_skills_for_task(
-            task_type=self.task_ctx.task_type,
-            query=self.task_ctx.task_goal,
-            top_k=self.config.h5_top_k,
-        )
-        result = []
-        for skill in skills:
-            text = _truncate_to_word_budget(skill["text"], self.config.h5_cold_start_max_words)
-            result.append({
-                "id": skill["id"],
-                "text": text,
-                "trigger": "cold_start",
-                "token_cost": str(len(text.split())),
-            })
-        return result
+
+        skill_id = _H5_CONTRACT_MAP.get(self.task_ctx.task_type)
+        if skill_id is None:
+            return []
+
+        skill = next((s for s in ALF_SKILLS if s["id"] == skill_id), None)
+        if skill is None:
+            return []
+
+        text = _truncate_to_word_budget(skill["text"], self.config.h5_cold_start_max_words)
+        return [{"id": skill_id, "text": text, "trigger": "cold_start",
+                 "token_cost": str(len(text.split()))}]
 
     def step_guidance(self, current_round: int, max_step: int, admissible: List[str]) -> Optional[str]:
         """
@@ -1356,72 +1401,17 @@ def patch_take_action_tool_description(
 # ─────────────────────────────────────────────────────────────────────────────
 
 ALF_SKILLS: List[Dict[str, Any]] = [
+    # ── Tool-contract skills (injectable via H5) ──────────────────────────────
+    # These encode non-obvious preconditions that models miss from pretraining.
+    # H5 injects one of these at cold-start for task types with a known blind spot.
     {
-        "id": "pickup_then_deliver",
-        "task_types": ["pick_and_place", "pick_two_obj"],
-        "keywords": ["put", "place", "locate", "navigate", "deliver"],
-        "text": (
-            "For placement tasks: locate the target object, take it, "
-            "navigate directly to the destination receptacle, then put it there."
-        ),
-    },
-    {
-        "id": "state_changing_actions_only",
-        "task_types": ["pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place"],
-        "keywords": ["clean", "heat", "cool", "transform", "appliance"],
-        "text": (
-            "For transformation tasks: take the object to the required appliance "
-            "(sinkbasin/microwave/fridge), apply the transformation, "
-            "then deliver to the final destination."
-        ),
-    },
-    {
-        "id": "two_object_staging",
-        "task_types": ["pick_two_obj"],
-        "keywords": ["two", "both", "second", "pair", "another"],
-        "text": (
-            "You can carry one item at a time. Deliver the first object to the "
-            "destination before collecting the second."
-        ),
-    },
-    {
-        "id": "examine_with_lamp",
-        "task_types": ["look_at_obj"],
-        "keywords": ["examine", "lamp", "light", "desklamp", "look"],
-        "text": (
-            "First go to the desklamp and turn it on, then find the target object, "
-            "take it, and examine it with the desklamp."
-        ),
-    },
-    {
-        "id": "explore_unseen_first",
-        "task_types": [
-            "pick_and_place", "pick_two_obj",
-            "pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place",
-        ],
-        "keywords": ["find", "locate", "search", "explore", "unvisited"],
-        "text": (
-            "When searching, prefer unvisited containers and locations over "
-            "revisiting already-explored areas."
-        ),
-    },
-    {
-        "id": "break_loops_early",
-        "task_types": [],   # not used for cold-start; injected by H4 recovery only
-        "keywords": ["loop", "repeat", "stuck", "stall", "revisit"],
-        "text": (
-            "If recent actions revealed no new objects or progress, "
-            "switch to a different unexplored location immediately."
-        ),
-    },
-    {
-        "id": "appliance_is_midpoint_not_destination",
+        "id": "take_before_visiting_appliance",
         "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
-        "keywords": ["fridge", "microwave", "sinkbasin", "destination", "deliver", "after", "then"],
+        "keywords": ["carry", "hold", "inventory", "pick up", "before", "appliance"],
         "text": (
-            "The transformation appliance (fridge/microwave/sinkbasin) is a midpoint, "
-            "not the destination. After transforming the object, pick it up from the appliance "
-            "and carry it to the separate destination receptacle."
+            "You cannot transform an object remotely. You MUST pick up the target object "
+            "first, then carry it in your inventory to the appliance. Visiting the appliance "
+            "without holding the object accomplishes nothing."
         ),
     },
     {
@@ -1435,22 +1425,72 @@ ALF_SKILLS: List[Dict[str, Any]] = [
             "then use the exact 'examine X with desklamp' action."
         ),
     },
+
+    # ── Strategy skills (NOT injectable via H5) ───────────────────────────────
+    # task_types=[] means retrieve_skills_for_task never returns them.
+    # H3 covers step sequence; H4 per-step guidance covers exploration and stall
+    # recovery reactively. Injecting these at cold-start duplicates H3/H4 and
+    # adds noise for small models — experiments showed no-H5 outperforms H5
+    # when only strategy skills are injected.
     {
-        "id": "take_before_visiting_appliance",
-        "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
-        "keywords": ["carry", "hold", "inventory", "pick up", "before", "appliance"],
+        "id": "pickup_then_deliver",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["put", "place", "locate", "navigate", "deliver"],
         "text": (
-            "You cannot transform an object remotely. You MUST pick up the target object "
-            "first, then carry it in your inventory to the appliance. Visiting the appliance "
-            "without holding the object accomplishes nothing."
+            "For placement tasks: locate the target object, take it, "
+            "navigate directly to the destination receptacle, then put it there."
+        ),
+    },
+    {
+        "id": "state_changing_actions_only",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["clean", "heat", "cool", "transform", "appliance"],
+        "text": (
+            "For transformation tasks: take the object to the required appliance "
+            "(sinkbasin/microwave/fridge), apply the transformation, "
+            "then deliver to the final destination."
+        ),
+    },
+    {
+        "id": "two_object_staging",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["two", "both", "second", "pair", "another"],
+        "text": (
+            "You can carry one item at a time. Deliver the first object to the "
+            "destination before collecting the second."
+        ),
+    },
+    {
+        "id": "examine_with_lamp",
+        "task_types": [],  # strategy — superseded by examine_plain_is_useless (tool contract)
+        "keywords": ["examine", "lamp", "light", "desklamp", "look"],
+        "text": (
+            "First go to the desklamp and turn it on, then find the target object, "
+            "take it, and examine it with the desklamp."
+        ),
+    },
+    {
+        "id": "explore_unseen_first",
+        "task_types": [],  # strategy — covered by H4 navigation hints
+        "keywords": ["find", "locate", "search", "explore", "unvisited"],
+        "text": (
+            "When searching, prefer unvisited containers and locations over "
+            "revisiting already-explored areas."
+        ),
+    },
+    {
+        "id": "appliance_is_midpoint_not_destination",
+        "task_types": [],  # strategy — covered by H3; also wrong when dest IS an appliance
+        "keywords": ["fridge", "microwave", "sinkbasin", "destination", "deliver", "after", "then"],
+        "text": (
+            "The transformation appliance (fridge/microwave/sinkbasin) is a midpoint, "
+            "not the destination. After transforming the object, pick it up from the appliance "
+            "and carry it to the separate destination receptacle."
         ),
     },
     {
         "id": "nothing_happens_means_wrong_state",
-        "task_types": [
-            "pick_and_place", "pick_two_obj",
-            "pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place",
-        ],
+        "task_types": [],  # strategy — H4 handles this reactively after the fact
         "keywords": ["nothing happens", "wrong", "state", "repeat", "fail", "stuck"],
         "text": (
             "'Nothing happens' means the action is invalid for the current state — "
@@ -1460,12 +1500,21 @@ ALF_SKILLS: List[Dict[str, Any]] = [
     },
     {
         "id": "two_obj_second_item_different_location",
-        "task_types": ["pick_two_obj"],
+        "task_types": [],  # strategy — covered by H4 world model placed_items filter
         "keywords": ["second", "another", "two", "different", "source", "destination"],
         "text": (
             "After delivering the first object, search for the second in unexplored locations. "
             "Never pick up an object you just placed at the destination. "
             "If the destination looks like a source location, confirm the item is a new one."
+        ),
+    },
+    {
+        "id": "break_loops_early",
+        "task_types": [],  # not injectable; injected by H4 recovery only
+        "keywords": ["loop", "repeat", "stuck", "stall", "revisit"],
+        "text": (
+            "If recent actions revealed no new objects or progress, "
+            "switch to a different unexplored location immediately."
         ),
     },
 ]

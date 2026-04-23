@@ -69,9 +69,13 @@ dbbench-env_train:
     name: dbbench-env_train
     data_file: "data/dbbench/db_out_new.jsonl"
     db_file: "data/dbbench/db_train"
-    shuffle_seed: 44
+    shuffle_seed: 45
     # Adjust this number to control train-set sampling size.
     sample_size: 100
     harness:
       enabled: true
       h5_top_k: 3
+      h2: true              # action gate + SQL rewrite + commit gate + answer normalisation
+      h3: true              # tool/prompt static hints + schema card
+      h4: true              # post-step monitor + budget warn/force
+      h5: true              # skill library + step guidance

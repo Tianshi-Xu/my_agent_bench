@@ -221,6 +221,22 @@ class ALFWorld(Task):
         if harness_runtime:
             # H0: parse task context and seed world model
             harness_runtime.init_task(init_prompt, initial_admissible)
+        if harness_runtime and self.harness_config.h3_enabled and harness_runtime.task_ctx:
+            # H3 per-episode: inject task-type-specific strategy hint now that task_ctx is known.
+            # The class-level tool description patch applies a generic protocol reminder;
+            # this adds the task-specific step sequence (pick_and_place, look_at_obj, etc.)
+            # which was previously unreachable at class init time.
+            h3_task_hint = harness_runtime.build_h3_hint()
+            session.inject(ChatCompletionSystemMessageParam(
+                role='system',
+                content=f"Task strategy: {h3_task_hint}",
+            ))
+            log_info["harness_trace"]["h3"].append({
+                "round": 0,
+                "hint_applied": True,
+                "hint_text": h3_task_hint,
+                "token_cost": len(h3_task_hint.split()),
+            })
         if harness_runtime and self.harness_config.h5_enabled:
             # H5 cold-start: task-type-mapped skill hint (replaces BM25 retrieval)
             cold_skills = harness_runtime.cold_start_skill_hints()
@@ -396,15 +412,6 @@ class ALFWorld(Task):
                         "text": step_hint,
                         "token_cost": str(len(step_hint.split())),
                     })
-            if harness_runtime and self.harness_config.h3_enabled:
-                log_info["harness_trace"]["h3"].append(
-                    {
-                        "round": i + 1,
-                        "hint_applied": True,
-                        "token_cost": self.harness_config.h3_max_words,
-                    }
-                )
-
             # failure test
             if len(log_info["log"]) > 3:
                 pre_logs = log_info["log"][-3:]

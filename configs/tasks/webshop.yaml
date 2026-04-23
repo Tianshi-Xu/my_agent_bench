@@ -48,11 +48,11 @@ webshop-env_train:
     name: webshop-env_train
     start: 1000
     end: 10000
-    shuffle_seed: 42
-    sample_size: 20
-    enabled: false
+    shuffle_seed: 43
+    sample_size: 100
+    enabled: true
     h2: true
     h3: true
     h4: true
     h5: true
-    h5_top_k: 3
+    h5_top_k: 2
