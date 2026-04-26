@@ -170,6 +170,7 @@ class OSInteraction(Task):
         h4 = kwargs.pop("h4", True)
         h5 = kwargs.pop("h5", True)
         h5_top_k = kwargs.pop("h5_top_k", 2)
+        h5_score_threshold = kwargs.pop("h5_score_threshold", 6.0)
         self.harness_config = OSHarnessConfig(
             enabled=bool(enabled),
             h2_enabled=bool(h2),
@@ -177,6 +178,7 @@ class OSInteraction(Task):
             h4_enabled=bool(h4),
             h5_enabled=bool(h5),
             h5_top_k=int(h5_top_k),
+            h5_score_threshold=float(h5_score_threshold),
         )
         # H3 tool description patching (apply once at class init)
         if self.harness_config.enabled and self.harness_config.h3_enabled:

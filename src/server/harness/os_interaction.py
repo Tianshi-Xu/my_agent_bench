@@ -10,9 +10,37 @@ H2  Action Gate            — text-embedded tool-call rescue (JSON/kwarg/positi
 H3  Tool Description Patch — static shell strategy / tool-format hints
 H4  Post-step Monitor      — truncation / error / empty-output / loop + budget warn/force
                              (budget logic is part of H4 — single post-bash trigger)
-H5  Goal-directed Hint     — task-type-aware skill (BM25) + per-step guidance
+H5  Goal-directed Hint     — task-type-aware skill (BM25 + score threshold + context
+                             override) + per-step guidance
                              (lint only fires when no candidate exists to avoid over-correction;
                               submit hint suppressed when H4 has active recovery prompt)
+
+Architecture changes (v6 vs v5):
+  - H5 score threshold (h5_score_threshold=6.0): skills scoring below threshold are NOT
+    injected even if ranked #1 — prevents noisy low-relevance injections (IDX 426/663
+    had BM25=5.36 and were harmful; now blocked).
+  - H5 context-driven case_insensitive_hint override: when ctx.case_sensitive is False,
+    case_insensitive_hint is force-inserted into the top-k result even if a higher-scoring
+    skill won BM25 (fixes IDX 31/83/809 where "Ignore case" tasks got wrong skill).
+  - H5 _CASE_INSENS_SIGNALS extended with "ignore case" + regex fallback to detect
+    "Ignore case sensitivity" phrasing that was previously not parsed.
+  - H5 home_dir_file_glob keywords narrowed from ["home","txt","text","files",...] to
+    ["glob","wildcard","star","asterisk"] — skill was over-matching most home-dir file
+    tasks; H4's no_such_file recovery handles actual glob mistakes reactively.
+  - H5 case_insensitive_hint keywords: removed bare "case" (too generic, caused false
+    positives on unrelated unique-IP tasks).
+  - H4 _ERROR_RE extended with "invalid mode", "invalid option", "unrecognized option",
+    "find: warning:", "grep: warning:", "xargs: warning:" — catches IDX 788 pattern
+    where find returned "invalid mode" error but zero-nudge fired instead of error path.
+  - H4 zero-nudge (step_guidance): replaced "run `ls` to verify" with softer message
+    that does NOT instruct additional exploration (prevents cascading wrong-exploration
+    when 0 IS the correct answer, e.g. mtime-filter tasks like IDX 245).
+  - H4 verification window extended from round_num==0 to round_num<=1 (first two bash
+    calls both emit "verify before committing" rather than "submit it") — guards against
+    round-1 premature submission of wrong intermediate answers (IDX 952).
+  - H4 candidate_string_answer guard: rejects single-line outputs longer than 120 chars
+    or starting with tool-name prefixes (find:/grep:/ls: etc.) — prevents find: warning:
+    text from being promoted as the string answer (IDX 663).
 
 Architecture changes (v5 vs v4):
   - H5 round-0 submit hint changed to verification nudge: "you got 'N' on your first
@@ -127,6 +155,10 @@ class OSHarnessConfig:
     # H5
     h5_top_k: int = 2
     h5_cold_start_max_words: int = 50
+    # Minimum BM25 score for a skill to be injected.  Skills scoring below this
+    # threshold are not injected even if they are ranked #1 — prevents noisy
+    # low-relevance injections that confuse the agent.
+    h5_score_threshold: float = 6.0
 
     # H4 budget (thresholds used by post_step_monitor ⑦)
     h4_budget_warn_threshold: int = 3       # remaining <= N → soft warn
@@ -284,7 +316,9 @@ OS_SKILLS: List[Dict[str, Any]] = [
     {
         "id": "case_insensitive_hint",
         "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE, TASK_COUNT_LINES],
-        "keywords": ["ignoring", "case", "regardless", "case-insensitive", "insensitive"],
+        # "case" alone is too generic (appears in many unrelated tasks).  Only use
+        # specific multi-word tokens that strongly signal case-insensitive intent.
+        "keywords": ["ignoring", "regardless", "insensitive", "case-insensitive", "ignore case"],
         "text": (
             "Task says 'ignoring case' or 'regardless of case' → add `-i` to "
             "grep (`grep -i`) or use `find ... -iname` instead of `-name`."
@@ -466,31 +500,40 @@ OS_SKILLS: List[Dict[str, Any]] = [
     # ── v5 specialised skills (added after 2026-04-19 v4 eval) ──────────────
     {
         "id": "lines_total_vs_excluding",
-        "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES],
-        "keywords": ["excluding", "except", "without", "not containing", "total", "all lines", "non-empty"],
+        # Narrow: only inject when the task involves EXCLUDING lines (grep -v).
+        # Removed "total"/"all lines" keywords — too broad and caused IDX 419
+        # (count lines CONTAINING pattern) to receive confusing "Total ALL lines: wc -l" tip.
+        "task_types": [TASK_COUNT_LINES],
+        "keywords": ["excluding", "except", "without", "not containing", "non-empty", "invert"],
         "text": (
-            "Total ALL lines: `wc -l FILE` or `find DIR -name '*.EXT' -exec cat {} + | wc -l`. "
-            "Lines CONTAINING pattern: `grep -rh PATTERN DIR | wc -l`. "
             "Lines EXCLUDING pattern: `grep -v PATTERN FILE | wc -l` (add -r for dirs). "
-            "Make sure to use grep -v (invert), NOT grep PATTERN, when task says 'excluding'."
+            "Lines CONTAINING pattern: `grep -rh PATTERN DIR | wc -l`. "
+            "Total ALL lines (no filter): `wc -l FILE` or `find DIR -exec cat {} + | wc -l`. "
+            "Use grep -v (invert) ONLY when the task says 'excluding' / 'except' / 'without'."
         ),
     },
     {
         "id": "date_pattern_extract",
-        "task_types": [TASK_COUNT_UNIQUE, TASK_COUNT_MATCHES, TASK_COUNT_LINES],
-        "keywords": ["date", "dates", "timestamp", "unique", "year", "day", "month", "yyyy", "log", "entry"],
+        # Only for UNIQUE-date counting tasks, NOT for count_matches or count_lines.
+        # IDX 944 (count entries in March 2023) is count_matches → uses simple grep, not this skill.
+        # IDX 274/419 were harmed by injecting this skill for non-unique-date tasks.
+        "task_types": [TASK_COUNT_UNIQUE],
+        "keywords": ["date", "dates", "timestamp", "unique dates", "distinct dates", "yyyy", "different dates"],
         "text": (
-            "To extract unique dates from log files: "
-            "`grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' ~/logs/*.log | sort -u | wc -l`. "
-            "Never grep for literal 'YYYY-MM-DD' or 'MM/DD/YYYY' — those are templates, "
-            "not real dates. Run `head -3 FILE` first to see the actual date format."
+            "Run `head -3 FILE` first to see the actual date format. "
+            "To count UNIQUE dates: `grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' FILE | sort -u | wc -l`. "
+            "Use `[0-9]` NOT `\\d` — grep -E does not support \\d (use `[0-9]` instead). "
+            "If the date is always the first field, `awk '{print $1}' FILE | sort -u | wc -l` is safer. "
+            "To count ENTRIES on a specific date (not unique dates): `grep 'YYYY-MM-DD' FILE | wc -l`."
         ),
     },
     # ── v4 specialised skills (added after 2026-04-19 eval) ──────────────────
     {
         "id": "home_dir_file_glob",
         "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE],
-        "keywords": ["home", "txt", "text", "files", "home directory", "glob"],
+        # Narrow keywords: removed generic "home"/"txt"/"text"/"files" — causes over-injection.
+        # H4's no_such_file recovery handles glob mistakes reactively.
+        "keywords": ["glob", "wildcard", "star", "asterisk"],
         "text": (
             "Never use `~/.*\\.EXT` glob in bash — it produces 'No such file or directory'. "
             "Use `find DIR -name '*.EXT'` instead, where DIR is the target path. "
@@ -501,12 +544,57 @@ OS_SKILLS: List[Dict[str, Any]] = [
     {
         "id": "ip_status_extract",
         "task_types": [TASK_COUNT_UNIQUE],
-        "keywords": ["access", "http", "apache", "nginx", "web", "status", "200", "404", "request"],
+        # Extended keywords: add "ip"/"address" so this skill matches general IP extraction
+        # tasks, not just HTTP-specific ones.  The skill text now leads with the GENERIC
+        # approach before offering format-specific awk patterns.
+        "keywords": ["ip", "address", "addresses", "unique ip", "access", "http", "apache",
+                     "nginx", "web", "status", "200", "404", "request"],
         "text": (
-            "For HTTP access logs: count unique IPs with status code N: "
+            "General IP extraction (any log format): "
+            "`grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' FILE | sort -u | wc -l`. "
+            "Do NOT assume awk field position without checking: run `head -3 FILE` first. "
+            "Apache HTTP logs (IP in $1, status in $9): "
             "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`. "
-            "For SSH/auth logs: `grep 'Failed password' /var/log/auth.log | awk '{print $11}' | sort -u | wc -l`. "
-            "Do not grep for the status code after extracting IPs — the status code is in a different field."
+            "SSH auth logs: `grep 'Failed password' /var/log/auth.log | awk '{print $11}' | sort -u | wc -l`."
+        ),
+    },
+    # ── v6 specialised skills (added after 2026-04-26 v6 eval) ──────────────
+    {
+        "id": "atime_mtime_hint",
+        "task_types": [TASK_COUNT_FILES, TASK_SYSTEM_INFO],
+        "keywords": ["accessed", "access", "atime", "last access", "not been accessed",
+                     "access time", "last accessed", "last read"],
+        "text": (
+            "For files NOT ACCESSED in N days: `find DIR -type f -atime +N | wc -l` (atime = access time). "
+            "For files NOT MODIFIED in N days: `find DIR -type f -mtime +N | wc -l` (mtime = modify time). "
+            "These are DIFFERENT: `-atime` tracks reads, `-mtime` tracks writes. "
+            "Read the task carefully — 'accessed' → atime, 'modified/changed' → mtime."
+        ),
+    },
+    {
+        "id": "loc_count",
+        "task_types": [TASK_COUNT_LINES],
+        "keywords": ["code", "python", "java", "script", "source", "comments",
+                     "comment", "blank", "non-comment", "non-empty", "lines of code", "loc"],
+        "text": (
+            "To count non-comment/non-blank lines (lines of code): "
+            "`find DIR -type f -name '*.py' | xargs grep -vh '^[[:space:]]*#' | "
+            "grep -v '^[[:space:]]*$' | wc -l`. "
+            "The `-h` flag on grep suppresses filename prefixes so you count pure lines. "
+            "Use `[[:space:]]` not `\\s` — POSIX character classes work in grep -E, `\\s` does not."
+        ),
+    },
+    {
+        "id": "count_entries_by_date",
+        "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES],
+        "keywords": ["entries", "messages", "records", "january", "february", "march", "april",
+                     "may", "june", "july", "august", "september", "october", "november", "december",
+                     "month", "specific date", "occurred", "happened", "on the date"],
+        "text": (
+            "To count log ENTRIES on/in a specific date or month: "
+            "`grep 'YYYY-MM' FILE | wc -l` (for a month) or `grep 'YYYY-MM-DD' FILE | wc -l` (for a day). "
+            "Use simple grep with the date string — no regex needed for exact date matching. "
+            "Do NOT use grep -oE to extract dates when you want to COUNT lines, not extract values."
         ),
     },
 ]
@@ -516,23 +604,27 @@ def retrieve_os_skills(
     task_type: str,
     query: str,
     top_k: int = 2,
-) -> List[Dict[str, Any]]:
-    """Two-layer retrieval: task_type filter + BM25 ranking against query."""
+    score_threshold: float = 0.0,
+) -> List[Tuple[float, Dict[str, Any]]]:
+    """Two-layer retrieval: task_type filter + BM25 ranking against query.
+
+    Returns list of (score, skill) tuples ranked by descending score.
+    Skills with score < score_threshold are excluded (pass 0.0 for no filter).
+    """
     candidates = [s for s in OS_SKILLS if task_type in s.get("task_types", [])]
     if not candidates:
         # Fallback to the always-on skills (tagged with every type)
         candidates = [s for s in OS_SKILLS if _ALL_TASK_TYPES[0] in s.get("task_types", [])]
     if not candidates:
         return []
-    if len(candidates) <= top_k:
-        return candidates
     query_tokens = _bm25_tokenize(query)
     if not query_tokens:
-        return candidates[:top_k]
+        ranked = [(0.0, c) for c in candidates[:top_k]]
+        return [(s, c) for s, c in ranked if s >= score_threshold]
     docs = [_skill_doc_tokens(s) for s in candidates]
     scores = _bm25_scores(query_tokens, docs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    return [c for _, c in ranked[:top_k]]
+    return [(s, c) for s, c in ranked[:top_k] if s >= score_threshold]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,6 +648,8 @@ _RECURSIVE_SIGNALS = [
 _CASE_INSENS_SIGNALS = [
     "ignoring case", "regardless of case", "case-insensitive",
     "case insensitive", "irrespective of case",
+    "ignore case",          # "Ignore case sensitivity when searching"
+    "case sensitivity",     # "Ignore case sensitivity" (with ignore/ignoring nearby)
 ]
 
 _MUTATION_VERBS = [
@@ -729,9 +823,20 @@ def _detect_case_sensitivity(desc: str) -> Optional[bool]:
     t = desc.lower()
     for s in _CASE_INSENS_SIGNALS:
         if s in t:
+            # "case sensitivity" alone is ambiguous; require an ignore/insensitive
+            # verb nearby to avoid false positives on "case-sensitive" tasks.
+            if s == "case sensitivity":
+                if re.search(r"\b(ignor|insensitive|regardless|irrespective)\b", t):
+                    return False
+                continue
             return False
+    # Regex fallback: "ignore case" or "ignoring case" anywhere
+    if re.search(r"\bignor(?:e|ing)\s+case\b", t):
+        return False
     if "case-sensitive" in t or "case sensitive" in t:
-        return True
+        # Check it's not negated ("not case sensitive" / "case insensitive")
+        if not re.search(r"\b(not|in)\s*case.sensitive\b", t):
+            return True
     return None
 
 
@@ -800,7 +905,9 @@ _GREP_C_LINE_RE = re.compile(r"^[^\s:]+:\d+$")
 _ERROR_RE = re.compile(
     r"(command not found|no such file or directory|permission denied|syntax error|"
     r"not a directory|paths must precede expression|unary operator expected|"
-    r"binary file .{0,40} matches|cannot open|bad substitution|ambiguous redirect)",
+    r"binary file .{0,40} matches|cannot open|bad substitution|ambiguous redirect|"
+    r"invalid mode|invalid option|unrecognized option|illegal option|"
+    r"find: warning:|grep: warning:|xargs: warning:)",
     re.IGNORECASE,
 )
 _TRUNC_MARK = "[truncated because the output is too long]"
@@ -870,8 +977,8 @@ def bash_semantic_gaps(ctx: "OSTaskContext", bash: str) -> List[str]:
             gaps.append("task says 'ignoring case' — use `-iname` instead of `-name`")
     # Recursion mismatch
     if ctx.recursive is True:
-        recursive_tools = ("find", "grep -r", "grep -r ", "grep -rn", "grep -rh", "grep -rl", "grep -ri")
-        if not any(t in b for t in recursive_tools):
+        _has_recursive = "find" in b or bool(re.search(r"grep\s+-[a-zA-Z]*r[a-zA-Z]*", b))
+        if not _has_recursive:
             gaps.append("task mentions subdirectories — use `find` or `grep -r`, not plain `ls`/`grep`")
     if ctx.recursive is False and re.search(r"\bfind\b", b) and "-maxdepth" not in b:
         gaps.append("task says 'top directory only' — add `-maxdepth 1` to find")
@@ -1219,13 +1326,33 @@ class OSHarnessRuntime:
     def cold_start_skill_hints(self) -> List[Dict[str, str]]:
         if not self.config.h5_enabled or self.task_ctx is None:
             return []
-        skills = retrieve_os_skills(
+        scored = retrieve_os_skills(
             task_type=self.task_ctx.task_type,
             query=self.task_ctx.raw_description,
             top_k=self.config.h5_top_k,
+            score_threshold=self.config.h5_score_threshold,
         )
+        selected_skills: List[Dict[str, Any]] = [skill for _, skill in scored]
+
+        # Context-driven override: if the task is case-insensitive and
+        # case_insensitive_hint is not already in the results, force it in as
+        # the first skill (replacing the lowest-ranked result if at capacity).
+        # This prevents higher-scoring but less relevant skills from crowding
+        # out the most actionable tip for the agent.
+        if self.task_ctx.case_sensitive is False:
+            ci_skill = next(
+                (s for s in OS_SKILLS if s["id"] == "case_insensitive_hint"), None
+            )
+            if ci_skill is not None:
+                already_in = any(s["id"] == "case_insensitive_hint" for s in selected_skills)
+                if not already_in:
+                    if len(selected_skills) >= self.config.h5_top_k:
+                        selected_skills[-1] = ci_skill   # replace lowest-ranked
+                    else:
+                        selected_skills.insert(0, ci_skill)
+
         result: List[Dict[str, str]] = []
-        for skill in skills:
+        for skill in selected_skills:
             text = skill["text"]
             result.append({
                 "id": skill["id"],
@@ -1317,9 +1444,19 @@ class OSHarnessRuntime:
             self.state.empty_output_streak = 0
         if self.state.last_output_numeric_candidates:
             self.state.candidate_numeric_answer = self.state.last_output_numeric_candidates[-1]
-        # Single-line string candidate (for largest/smallest tasks with filename answer)
+        # Single-line string candidate (for largest/smallest tasks with filename answer).
+        # Guard: reject lines that look like tool-error/warning messages or are so long
+        # that they can't be a real answer (filenames, dates, etc. are short).
         lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-        if len(lines) == 1 and not self.state.last_output_had_error:
+        if (
+            len(lines) == 1
+            and not self.state.last_output_had_error
+            and len(lines[0]) <= 120
+            and not re.match(
+                r"^(find|grep|ls|awk|sed|cat|wc|sort|uniq|head|tail|xargs|bash|sh)\s*[:\(]",
+                lines[0], re.IGNORECASE,
+            )
+        ):
             self.state.candidate_string_answer = lines[0]
         # Candidate health: mark implausible only for awk overflow / negative /
         # huge values.  The "zero on filter task" heuristic was removed after
@@ -1608,17 +1745,18 @@ class OSHarnessRuntime:
         # recovery prompt (h4_audit_active=True) so the two signals don't
         # conflict.  Also suppressed for implausible values (awk overflow, etc.).
         #
-        # Round-0 special case (v5): on the FIRST bash call (round_num==0,
-        # bash_history has exactly 1 entry), emit a verification nudge instead of
-        # a direct "submit" hint.  Analysis of v4 failures showed 22/35 were
-        # 1-shot wrong-command submissions: the agent ran a semantically wrong bash
-        # (wrong pattern, wrong path, missing -i), got a number, and immediately
-        # submitted because H5 said "submit 'N'".  The nudge asks the agent to
-        # re-read the task before committing to the answer.
+        # Rounds 0–1 verification window (v6): on the first TWO bash calls emit a
+        # verification nudge rather than a direct "submit" hint.  Analysis of v4
+        # failures showed 22/35 were 1-shot wrong-command submissions (v5 fixed
+        # those with round-0 nudge).  Remaining analysis shows similar premature
+        # submission on round-1 (agent refines command slightly, gets a number,
+        # immediately submits before verifying flags like -i).  Extending the
+        # verification window to round<=1 keeps the extra-check pressure without
+        # blocking the agent from submitting from round 2 onwards.
         #
-        # From round 1+, the original submit hint fires as before.
-        #
-        # candidate==0 always gets a verification nudge (regardless of round).
+        # Zero special case: replaced aggressive "run ls" with a softer hint that
+        # doesn't push the agent into further exploration (which causes wrong
+        # answers when the true count IS 0, e.g. "files modified in last N days").
         if not h4_audit_active:
             if hint is None and (
                 ctx.answer_shape == ANSWER_INTEGER
@@ -1627,14 +1765,18 @@ class OSHarnessRuntime:
                 and not st.answered
             ):
                 if st.candidate_numeric_answer == '0':
+                    # Soft zero-nudge: don't instruct the agent to run `ls` —
+                    # that triggers additional H4 empty/path-error cascades when
+                    # 0 is actually the correct answer (e.g. mtime filter tasks).
                     hint = (
-                        "Harness: result is 0. Before submitting, verify your path "
-                        "and filter are correct — run `ls` on the target directory to "
-                        "confirm it exists and has the expected files. "
-                        "If the answer truly is 0, submit it."
+                        "Harness: result is 0. If your path and filter are correct "
+                        "(right directory, right extension, time/size constraints), "
+                        "0 is a valid answer — submit it. Only re-check the command "
+                        "if you suspect the path or filter may be wrong."
                     )
-                elif round_num == 0 and len(st.bash_history) == 1:
-                    # First bash — push for verification rather than immediate submission.
+                elif round_num <= 1 and len(st.bash_history) <= 2:
+                    # First two bash calls — push for verification rather than
+                    # immediate submission to guard against premature wrong submissions.
                     hint = (
                         f"Hint: your first command returned '{st.candidate_numeric_answer}'. "
                         f"Verify before committing: right directory? correct filter pattern? "

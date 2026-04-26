@@ -143,6 +143,7 @@ class WebShopHarnessConfig:
     # H5 skill retrieval
     h5_top_k: int = 2              # max skills injected at cold-start
     h5_cold_start_max_words: int = 50  # word cap per skill text
+    h5_score_threshold: float = 0.0  # min BM25 score; 0 = no threshold
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,17 +408,19 @@ def retrieve_webshop_skills(
     task_type: str,
     query: str,
     top_k: int = 2,
+    score_threshold: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
     Two-layer skill retrieval for WebShop:
       1. Hard filter — keep only skills whose task_types include task_type.
       2. BM25 ranking — rank filtered candidates by relevance to query.
+      3. Score threshold — drop skills below score_threshold (0 = no threshold).
     Returns up to top_k results.
     """
     candidates = [s for s in WEBSHOP_SKILLS if task_type in s.get("task_types", [])]
     if not candidates:
         return []
-    if len(candidates) <= top_k:
+    if len(candidates) <= top_k and score_threshold <= 0.0:
         return candidates
     query_tokens = _bm25_tokenize(query)
     if not query_tokens:
@@ -425,6 +428,8 @@ def retrieve_webshop_skills(
     docs = [_skill_doc_tokens(s) for s in candidates]
     scores = _bm25_scores(query_tokens, docs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+    if score_threshold > 0.0:
+        ranked = [(sc, c) for sc, c in ranked if sc >= score_threshold]
     return [c for _, c in ranked[:top_k]]
 
 
@@ -835,6 +840,84 @@ def extract_price(observation: str) -> Optional[float]:
     return None
 
 
+# Attribute section headers as they appear in WebShop observations.
+# Options under these headers are assigned to the mapped group.
+_ATTR_COLOR_HDRS = frozenset({"color", "colours", "color name", "colour"})
+_ATTR_SIZE_HDRS  = frozenset({"size", "sizes"})
+_ATTR_OTHER_HDRS = frozenset({
+    "flavor", "flavors", "flavour", "flavours", "flavor name",
+    "scent", "scents", "fragrance",
+    "style", "styles",
+    "material", "materials",
+    "pattern", "patterns",
+    "configuration",
+    "option", "options",
+    "type", "format",
+})
+
+
+def _extract_attr_with_obs(
+    observation: str,
+    clickables: List[str],
+) -> Dict[str, List[str]]:
+    """Primary attribute extractor using observation section headers.
+
+    Parses '[SEP]'-delimited observation to detect section headers (e.g.
+    'color', 'size', 'flavor name') and assigns subsequent clickable items to
+    the correct group. This correctly handles compound names ('metallic gun
+    metal'), alphanumeric codes ('c08'), and slug-style names ('greenwithoutlogo')
+    that token-based classification misses.
+
+    Falls back to extract_attribute_options for any clickables not placed by
+    the observation parser (e.g. when the observation is truncated).
+    """
+    clickable_lower_map: Dict[str, str] = {c.lower(): c for c in clickables}
+    parts = [p.strip() for p in re.split(r'\[SEP\]', observation)]
+
+    result: Dict[str, List[str]] = {}
+    current_group: Optional[str] = None
+    assigned: set = set()  # lowercase clickable values placed by obs parsing
+
+    for part in parts:
+        pl = part.lower()
+        if not pl:
+            continue
+        # Navigation stops and page-level tokens end any open attribute section
+        if pl in _NAV_CLICKABLES or pl in ("webshop",) or pl.startswith("instruction:"):
+            current_group = None
+            continue
+        # Section header detection
+        if pl in _ATTR_COLOR_HDRS:
+            current_group = "color"
+            continue
+        if pl in _ATTR_SIZE_HDRS:
+            current_group = "size"
+            continue
+        if pl in _ATTR_OTHER_HDRS:
+            current_group = "other"
+            continue
+        # Assign this part to the current section if it is a clickable option
+        if current_group is not None and pl in clickable_lower_map:
+            result.setdefault(current_group, []).append(clickable_lower_map[pl])
+            assigned.add(pl)
+
+    # Fallback: classify any clickables not covered by observation parsing
+    unassigned = [
+        c for c in clickables
+        if c.lower() not in assigned
+        and c.lower() not in _NAV_CLICKABLES
+        and not re.fullmatch(r"[a-z0-9]{10}", c.lower())
+    ]
+    if unassigned:
+        fallback = extract_attribute_options(unassigned)
+        for group, opts in fallback.items():
+            for opt in opts:
+                if opt.lower() not in assigned:
+                    result.setdefault(group, []).append(opt)
+
+    return {k: v for k, v in result.items() if v}
+
+
 def extract_attribute_options(clickables: List[str]) -> Dict[str, List[str]]:
     """
     Classify non-navigation clickables into attribute categories.
@@ -926,7 +1009,7 @@ def update_page_state(
             if asin not in state.asins_visited:
                 state.asins_visited.append(asin)
             state.selected_attributes = {}
-            state.attribute_options = extract_attribute_options(clickables)
+            state.attribute_options = _extract_attr_with_obs(observation, clickables)
             state.current_price = extract_price(observation)
             state._stall_asin = asin
             state._stall_turns = 0
@@ -937,7 +1020,7 @@ def update_page_state(
             # the selected option is gone and we can't match it.
             pre_click_opts = {k: list(v) for k, v in state.attribute_options.items()}
 
-            new_opts = extract_attribute_options(clickables)
+            new_opts = _extract_attr_with_obs(observation, clickables)
             if new_opts:
                 state.attribute_options = new_opts
             # Track attribute selection using PRE-click options.
@@ -1006,8 +1089,9 @@ _H3_SEARCH_HINT = (
     "WebShop search ignores price; use the product name and key features only."
 )
 _H3_CLICK_HINT = (
-    "Click a product from results, select ALL required attributes "
-    "(color, size, etc.) that match the task description, then click 'buy now'."
+    "On a product page, select ALL required attributes (color, size, variant, etc.) "
+    "that match the task description BEFORE clicking 'buy now'. "
+    "Check each option group on the page; leave nothing unselected if the task specifies it."
 )
 
 
@@ -1673,6 +1757,7 @@ class WebShopHarnessRuntime:
     # H2 state
     _last_click: Optional[str] = field(default=None)
     _repeat_click_count: int = field(default=0)
+    _total_buy_now_blocks: int = field(default=0)  # safety cap across all block reasons
 
     # H5 dedup
     _last_hint: Optional[str] = field(default=None)
@@ -1696,6 +1781,7 @@ class WebShopHarnessRuntime:
         self.force_next_action = None
         self._last_click = None
         self._repeat_click_count = 0
+        self._total_buy_now_blocks = 0  # safety cap across all block reasons
         self._defensive_buy_blocks = 0  # count defensive attr guard blocks
         self._product_mismatch_warned = False  # H4 flagged product mismatch
         self._mismatch_buy_blocks = 0  # times buy-now blocked after mismatch
@@ -1703,6 +1789,7 @@ class WebShopHarnessRuntime:
         self._last_hint_page = ""
         self._search_loop_resets = 0
         self._asin_stall_count = {}
+        self._price_warned_asins: set = set()  # ASINs already warned about price, to avoid repeat H4 loops
         self._h4_intervened = False  # set by post_step_monitor; suppresses H4-E on same turn
 
     # ── H5 cold-start ────────────────────────────────────────────────────────
@@ -1720,6 +1807,7 @@ class WebShopHarnessRuntime:
             task_type=self.requirements.task_type,
             query=self.requirements.raw_instruction,
             top_k=self.config.h5_top_k,
+            score_threshold=self.config.h5_score_threshold,
         )
         result = []
         for skill in skills:
@@ -1877,6 +1965,11 @@ class WebShopHarnessRuntime:
         if state.page_type != PAGE_PRODUCT_DETAIL:
             return None
 
+        # Safety valve: after too many blocks this episode, let buy now through
+        # to prevent the agent from getting stuck in an infinite retry loop.
+        if self._total_buy_now_blocks >= 4:
+            return None
+
         to_click: List[str] = []
 
         # Color check (handles OR alternatives: e.g. "lavender or ivory")
@@ -1936,40 +2029,37 @@ class WebShopHarnessRuntime:
                     continue
                 to_click.append(f"click '{match}' for {spec_req}")
 
-        # Instruction-grounded option check: block buy-now if a page option is
-        # semantically grounded in the task instruction and not yet selected.
-        # IG matches from the same "other" group are mutually exclusive (radio
-        # buttons), so ANY ONE being selected satisfies the group requirement.
-        other_opts = state.attribute_options.get("other", [])
-        ig_matches = _instruction_grounded_matches(req, other_opts)
-        if ig_matches:
-            sel_other = state.selected_attributes.get("other", "").lower()
-            ig_any_selected = sel_other and any(
-                ig_opt.lower() in sel_other for ig_opt in ig_matches
-            )
-            if not ig_any_selected:
-                to_click.append(f"click '{ig_matches[0]}'")  # suggest best match
-
         # Defensive attribute guard: if any attribute group has options but
         # nothing is selected, block buy-now even if H0 didn't parse a
         # requirement for that group. This catches cases where the instruction
         # doesn't mention color/size but the product requires a selection.
-        # Allow through after 2 blocks to prevent infinite loops.
+        # Extends to "other" group (catches alphanumeric codes like "c08" and
+        # slug-style names like "greenwithoutlogo" when observation-based parsing
+        # places them correctly under "color", and also "other" variants).
+        # Allow through after 2 defensive blocks to prevent infinite loops.
         if not to_click and self._defensive_buy_blocks < 2:
-            unselected_groups = []
-            for group in ("color", "size"):
-                opts = state.attribute_options.get(group, [])
-                sel = state.selected_attributes.get(group, "")
-                if opts and not sel:
-                    unselected_groups.append((group, opts))
-            if unselected_groups:
-                self._defensive_buy_blocks += 1
-                for group, opts in unselected_groups:
-                    to_click.append(f"select a {group} (options: {', '.join(opts[:4])})")
+            any_selected = any(v for v in state.selected_attributes.values())
+            # Only fire defensive guard when agent hasn't selected ANY attribute yet.
+            # If any selection was made, trust the agent is on the right track.
+            if not any_selected:
+                unselected_groups = []
+                for group in ("color", "size"):
+                    opts = state.attribute_options.get(group, [])
+                    sel = state.selected_attributes.get(group, "")
+                    if opts and not sel:
+                        unselected_groups.append((group, opts))
+                other_def_opts = state.attribute_options.get("other", [])
+                if other_def_opts and not state.selected_attributes.get("other", ""):
+                    unselected_groups.append(("attribute", other_def_opts))
+                if unselected_groups:
+                    self._defensive_buy_blocks += 1
+                    for group, opts in unselected_groups:
+                        to_click.append(f"select a {group} (options: {', '.join(opts[:4])})")
 
         if not to_click:
             return None
 
+        self._total_buy_now_blocks += 1
         instructions = "; ".join(to_click[:3])
         return (
             f"You must select required attributes before buying. "
@@ -2073,18 +2163,23 @@ class WebShopHarnessRuntime:
             self._h4_intervened = True
             return response
 
-        # ② Price over budget (on product page)
+        # ② Price over budget (on product page) — fires at most once per ASIN to
+        # prevent repeat-fire loops (agent gets stuck between price-warn and
+        # search-block when search isn't available on product pages).
+        asin_for_price = state.current_asin or ""
         if (
             state.page_type == PAGE_PRODUCT_DETAIL
             and state.current_price is not None
             and req.price_max is not None
             and state.current_price > req.price_max * (1 + self.config.price_tolerance)
+            and asin_for_price not in self._price_warned_asins
         ):
+            self._price_warned_asins.add(asin_for_price)
             response["audit_reason"] = "price_over_budget"
             response["intervention_level"] = "soft"
             response["recovery_prompt"] = (
                 f"Harness: this product costs ${state.current_price:.2f} but your budget is "
-                f"${req.price_max:.0f}. Go back to search and find a cheaper option."
+                f"${req.price_max:.0f}. Click 'back to search' and find a cheaper option."
             )
             self._h4_intervened = True
             return response

@@ -69,6 +69,7 @@ class WebShop(Task):
         h4 = configs.pop("h4", True)
         h5 = configs.pop("h5", True)
         h5_top_k = configs.pop("h5_top_k", 2)
+        h5_score_threshold = configs.pop("h5_score_threshold", 0.0)
         self.harness_config = WebShopHarnessConfig(
             enabled=bool(enabled),
             h2_enabled=bool(h2),
@@ -76,6 +77,7 @@ class WebShop(Task):
             h4_enabled=bool(h4),
             h5_enabled=bool(h5),
             h5_top_k=int(h5_top_k),
+            h5_score_threshold=float(h5_score_threshold),
         )
         if self.harness_config.enabled and self.harness_config.h3_enabled:
             tools = patch_webshop_tool_descriptions(tools)

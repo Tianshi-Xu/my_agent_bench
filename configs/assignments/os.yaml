@@ -14,5 +14,5 @@ assignments:
       - os-env_train
       # - os-std
 
-output: "outputs/os/{TIMESTAMP}-harness"
+output: "outputs/os/{TIMESTAMP}-no-h4"
 trials: 1
