@@ -1,5 +1,5 @@
 """
-OS Interaction Harness — H0/H1/H2/H3/H4/H5  (v5)
+OS Interaction Harness — H0/H1/H2/H3/H4/H5  (v7)
 
 H0  Task Parser            — one-time shell-task classification per episode
 H1  Shell & Conv State     — per-round bash history, output candidates, truncation flags
@@ -14,6 +14,25 @@ H5  Goal-directed Hint     — task-type-aware skill (BM25 + score threshold + c
                              override) + per-step guidance
                              (lint only fires when no candidate exists to avoid over-correction;
                               submit hint suppressed when H4 has active recovery prompt)
+
+Architecture changes (v7 vs v6):
+  - H5 files_containing_pattern: removed TASK_COUNT_MATCHES — this skill says "Count FILES
+    (not lines)" which is actively wrong for count_matches tasks that count lines in files.
+    Kept only TASK_COUNT_FILES.  Fixes IDX 222/493/510/780/998 false injections.
+  - H5 home_dir_file_glob: restricted to [COUNT_FILES, COUNT_LINES] (removed COUNT_MATCHES,
+    COUNT_UNIQUE).  Replaced example "~/project_files" → "~/mysubdir" to prevent BM25
+    false-match against "project_logs" task descriptions (IDX 215 fix).
+  - H5 count_entries_by_date: removed generic keywords "entries"/"messages"/"records" —
+    these caused injection for ERROR-counting tasks with no date context (IDX 632).
+    Added "yyyy-mm" to reinforce date-specificity signal.
+  - H5 today_date_command: removed bare "date" from keywords (too generic, caused IDX 932
+    unique-ERROR task to receive this tip).  Changed text to remove "log file" phrase.
+  - H5 ip_status_extract: rewrote to lead with `head -3 FILE` advice and explicitly
+    recommend `awk '{print $1}'` when task says "each line starts with IP" — grep -oE
+    inflates count by matching IPs embedded in timestamps (IDX 524/577/859 pattern).
+  - H0 _detect_task_type: added pre-check for "how many files contain X" → TASK_COUNT_FILES
+    before the generic contain+count → TASK_COUNT_MATCHES rule, fixing misclassification of
+    IDX 215-style tasks ("how many log files contain the word ERROR").
 
 Architecture changes (v6 vs v5):
   - H5 score threshold (h5_score_threshold=6.0): skills scoring below threshold are NOT
@@ -172,8 +191,28 @@ class OSHarnessConfig:
 # BM25 retrieval (for H5 cold-start)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Stopwords excluded from BM25 scoring — these appear in every task description
+# and every skill text, so they carry zero discriminative power and inflate scores
+# for skills that happen to share common English words with the query.
+# NOTE: domain terms like "file", "directory", "count" are NOT stopwords here —
+# they are discriminating for OS subtask types.  Only pure function words are
+# excluded.  Adding "task" prevents false match via "your task is to" phrasing.
+_BM25_STOPWORDS: set = {
+    "a", "an", "the", "in", "of", "for", "to", "is", "it", "at", "be", "as",
+    "with", "by", "from", "that", "this", "have", "has", "had", "do", "did",
+    "does", "we", "you", "your", "they", "are", "was", "were", "all", "any",
+    "not", "or", "and", "but", "if", "on", "so", "up", "can", "may", "how",
+    "what", "which", "when", "where", "who", "will", "would", "should", "could",
+    "each", "its", "into", "also", "than", "then", "there", "these", "those",
+    "some", "same", "other", "such", "only", "no", "more", "out", "across",
+    "use", "used", "using", "e", "g", "i", "s", "m", "d", "h", "n", "r",
+    "task",
+}
+
+
 def _bm25_tokenize(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", (text or "").lower())
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [t for t in toks if t not in _BM25_STOPWORDS]
 
 
 def _skill_doc_tokens(skill: Dict[str, Any]) -> List[str]:
@@ -414,11 +453,14 @@ OS_SKILLS: List[Dict[str, Any]] = [
     {
         "id": "today_date_command",
         "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES, TASK_COUNT_UNIQUE, TASK_COUNT_FILES],
-        "keywords": ["today", "current date", "this day", "date"],
+        # Removed bare "date" from keywords: too generic, caused false injection for log tasks
+        # that mention dates in passing (IDX 932 unique-ERROR-message task was hit).
+        # Keep only strong "today"/"current date"/"this day" signals.
+        "keywords": ["today", "current date", "this day"],
         "text": (
             "When the task says 'today', get the actual date with `date +%Y-%m-%d` and use it in "
             "your grep: `grep \"$(date +%Y-%m-%d)\" FILE | ...`. "
-            "Do not hardcode a date from the log file — it may be the wrong day."
+            "Do not hardcode a specific past date — it may be the wrong day."
         ),
     },
     # ── v2 specialised skills (added after 2026-04-18 eval) ──────────────────
@@ -456,7 +498,11 @@ OS_SKILLS: List[Dict[str, Any]] = [
     },
     {
         "id": "files_containing_pattern",
-        "task_types": [TASK_COUNT_FILES, TASK_COUNT_MATCHES],
+        # ONLY for count_files: this skill says "Count FILES (not lines)" which is
+        # actively wrong for count_matches tasks (which count lines/matches, not files).
+        # Removed TASK_COUNT_MATCHES to prevent injection when tasks count LINES in files
+        # that contain a pattern (IDX 222/493/510/780/998 were harmed by wrong injection).
+        "task_types": [TASK_COUNT_FILES],
         "keywords": ["files", "containing", "include", "with", "mention", "word", "which"],
         "text": (
             "Count FILES (not lines) that contain a pattern: "
@@ -530,14 +576,16 @@ OS_SKILLS: List[Dict[str, Any]] = [
     # ── v4 specialised skills (added after 2026-04-19 eval) ──────────────────
     {
         "id": "home_dir_file_glob",
-        "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE],
-        # Narrow keywords: removed generic "home"/"txt"/"text"/"files" — causes over-injection.
-        # H4's no_such_file recovery handles glob mistakes reactively.
+        # Narrowed to COUNT_FILES and COUNT_LINES only: MATCHES and UNIQUE caused false
+        # injections for unrelated tasks (IDX 215 got this tip for a unique-error-counting
+        # task and ran the wrong path).  Example subdir renamed from "project_files" to
+        # "mysubdir" to prevent BM25 false-match against "project_logs" task descriptions.
+        "task_types": [TASK_COUNT_FILES, TASK_COUNT_LINES],
         "keywords": ["glob", "wildcard", "star", "asterisk"],
         "text": (
             "Never use `~/.*\\.EXT` glob in bash — it produces 'No such file or directory'. "
             "Use `find DIR -name '*.EXT'` instead, where DIR is the target path. "
-            "If the task specifies a subdirectory (e.g. '~/project_files'), use that full path — "
+            "If the task specifies a subdirectory (e.g. '~/mysubdir'), use that full path — "
             "NOT just `~` or `find ~ -maxdepth 1`."
         ),
     },
@@ -547,15 +595,19 @@ OS_SKILLS: List[Dict[str, Any]] = [
         # Extended keywords: add "ip"/"address" so this skill matches general IP extraction
         # tasks, not just HTTP-specific ones.  The skill text now leads with the GENERIC
         # approach before offering format-specific awk patterns.
-        "keywords": ["ip", "address", "addresses", "unique ip", "access", "http", "apache",
+        # Removed "unique ip" — "unique" alone caused false BM25 matches against tasks
+        # asking for "unique error messages" (IDX 215/932), pushing out grep_bracket_word_bug.
+        "keywords": ["ip", "address", "addresses", "access", "http", "apache",
                      "nginx", "web", "status", "200", "404", "request"],
         "text": (
-            "General IP extraction (any log format): "
-            "`grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' FILE | sort -u | wc -l`. "
-            "Do NOT assume awk field position without checking: run `head -3 FILE` first. "
-            "Apache HTTP logs (IP in $1, status in $9): "
-            "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`. "
-            "SSH auth logs: `grep 'Failed password' /var/log/auth.log | awk '{print $11}' | sort -u | wc -l`."
+            "Run `head -3 FILE` to check structure before picking an approach. "
+            "When each IPv4 line STARTS with an IP (first field): "
+            "`awk '{print $1}' FILES | sort -u | wc -l` — preferred over grep -oE "
+            "which over-counts by matching partial sub-patterns. "
+            "Generic IPv4 extraction (IP anywhere): "
+            "`grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' FILES | sort -u | wc -l`. "
+            "Apache/nginx access logs (IP=$1, status=$9): "
+            "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`."
         ),
     },
     # ── v6 specialised skills (added after 2026-04-26 v6 eval) ──────────────
@@ -587,14 +639,22 @@ OS_SKILLS: List[Dict[str, Any]] = [
     {
         "id": "count_entries_by_date",
         "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES],
-        "keywords": ["entries", "messages", "records", "january", "february", "march", "april",
+        # Removed generic keywords "entries"/"messages"/"records": too broad, caused false
+        # injection for ERROR-counting tasks (IDX 632) where no specific date is involved.
+        # Retained month names and explicit date phrases as the discrimination signal.
+        # Removed "yyyy-mm" — it matched log format strings like "[YYYY-MM-DD HH:MM:SS]"
+        # in tasks that mention date format without asking about a specific date (IDX 552).
+        "keywords": ["january", "february", "march", "april",
                      "may", "june", "july", "august", "september", "october", "november", "december",
                      "month", "specific date", "occurred", "happened", "on the date"],
         "text": (
-            "To count log ENTRIES on/in a specific date or month: "
+            "To count log EVENTS on/in a specific date or month: "
             "`grep 'YYYY-MM' FILE | wc -l` (for a month) or `grep 'YYYY-MM-DD' FILE | wc -l` (for a day). "
             "Use simple grep with the date string — no regex needed for exact date matching. "
-            "Do NOT use grep -oE to extract dates when you want to COUNT lines, not extract values."
+            "Do NOT use grep -oE to extract dates when you want to COUNT lines, not extract values. "
+            "If the task asks for events on the MOST RECENT date (not a fixed date), first find "
+            "the latest date: `grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' FILE | sort | tail -1`, "
+            "then grep for that date."
         ),
     },
 ]
@@ -729,6 +789,13 @@ def _detect_task_type(desc: str) -> str:
         if re.search(r"\bcontain(?:ing)?\b|\bmatch(?:ing)?\b|\bwith\s+the\s+word\b", t):
             return TASK_COUNT_MATCHES
         return TASK_COUNT_LINES
+    # "how many/count files that contain X" → count_files, not count_matches.
+    # Must be checked BEFORE the generic contain+count → count_matches rule, which
+    # otherwise fires first and misclassifies file-counting tasks (e.g. IDX 215:
+    # "how many log files contain the word ERROR").
+    if re.search(r"\bhow\s+many\s+(?:\w+\s+){0,3}files?\b", t) and \
+       re.search(r"\bcontain(?:ing)?\b", t):
+        return TASK_COUNT_FILES
     if re.search(r"\bcontain(?:ing)?\b|\bmatch(?:ing)?\b", t) and re.search(r"\bcount|number\s+of|how\s+many\b", t):
         return TASK_COUNT_MATCHES
     if re.search(r"\bcount\b|\bnumber\s+of\b|\bhow\s+many\b", t) and re.search(r"\bfiles?\b|\bdirector(?:y|ies)\b|\bfolders?\b", t):

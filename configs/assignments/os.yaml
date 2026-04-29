@@ -14,5 +14,5 @@ assignments:
       - os-env_train
       # - os-std
 
-output: "outputs/os/{TIMESTAMP}-no-h4"
+output: "outputs/os/{TIMESTAMP}-no-h3"
 trials: 1

@@ -14,5 +14,5 @@ assignments:
       - webshop-env_train
       # - webshop-std
 
-output: "outputs/webshop/{TIMESTAMP}-harness"
+output: "outputs/webshop/{TIMESTAMP}-no-h3"
 trials: 1

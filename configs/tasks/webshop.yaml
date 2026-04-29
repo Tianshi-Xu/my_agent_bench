@@ -53,7 +53,7 @@ webshop-env_train:
     sample_size: 100
     enabled: true
     h2: true
-    h3: true
+    h3: false
     h4: true
     h5: true
     h5_top_k: 1
