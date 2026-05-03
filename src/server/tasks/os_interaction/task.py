@@ -162,15 +162,17 @@ class OSInteraction(Task):
                  env_options: Optional[dict] = None,
                  shuffle_seed=None,
                  sample_size=None,
+                 task_ids=None,
                  **kwargs):
+        task_ids = task_ids or os.environ.get("OS_TASK_IDS")
         # Harness config — pop before super init
         enabled = kwargs.pop("enabled", False)
         h2 = kwargs.pop("h2", True)
         h3 = kwargs.pop("h3", True)
         h4 = kwargs.pop("h4", True)
         h5 = kwargs.pop("h5", True)
-        h5_top_k = kwargs.pop("h5_top_k", 2)
-        h5_score_threshold = kwargs.pop("h5_score_threshold", 6.0)
+        h5_top_k = kwargs.pop("h5_top_k", 1)
+        h5_score_threshold = kwargs.pop("h5_score_threshold", 7.5)
         self.harness_config = OSHarnessConfig(
             enabled=bool(enabled),
             h2_enabled=bool(h2),
@@ -192,6 +194,7 @@ class OSInteraction(Task):
         self.full_async = True
         self.shuffle_seed = shuffle_seed
         self.sample_size = sample_size
+        self.task_ids = self._parse_task_ids(task_ids)
         self.problem_configs: Dict[str, Dict[str, Any]] = {}  # {index: CONFIG}
 
         matches = []
@@ -241,6 +244,23 @@ class OSInteraction(Task):
             return await _orig_exec_cmd(environment_id, command, timeout=float(timeout))
 
         self.env_controller.execute_command = _patched_execute_command
+
+    @staticmethod
+    def _parse_task_ids(task_ids) -> Optional[List[int]]:
+        if task_ids is None:
+            return None
+        if isinstance(task_ids, str):
+            raw_items = re.split(r"[\s,]+", task_ids.strip())
+        elif isinstance(task_ids, (list, tuple)):
+            raw_items = task_ids
+        else:
+            raw_items = [task_ids]
+        parsed: List[int] = []
+        for item in raw_items:
+            if item is None or item == "":
+                continue
+            parsed.append(int(item))
+        return parsed or None
 
     def _load_configs(self, config_path, script_root_dir=".") -> List[JudgeConfig]:
         def load_script(script_obj):
@@ -360,6 +380,14 @@ class OSInteraction(Task):
         }
 
     def get_indices(self) -> List[Any]:
+        if self.task_ids is not None:
+            missing = [idx for idx in self.task_ids if idx not in self.problem_configs]
+            if missing:
+                raise ValueError(
+                    f"Unknown OS task id(s): {missing}. Valid range is "
+                    f"0..{max(self.problem_configs.keys()) if self.problem_configs else -1}."
+                )
+            return list(self.task_ids)
         indices = list(self.problem_configs.keys())
         if self.shuffle_seed is not None:
             random.Random(self.shuffle_seed).shuffle(indices)

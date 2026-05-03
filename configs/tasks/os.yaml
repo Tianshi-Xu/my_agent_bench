@@ -11,9 +11,9 @@ default:
     h4: true   # post-step monitor: truncation / errors / empty / loop + budget warn/force
     h5: true   # BM25 skill library (27 skills) + per-step guidance
     # Only h2/h3/h4/h5 are exposed — budget lives in h4, answer normalisation in h2.
-    h5_top_k: 2
+    h5_top_k: 1
     # Minimum BM25 score for a skill to be injected (v6: guards low-relevance injections).
-    h5_score_threshold: 6.0
+    h5_score_threshold: 7.5
     tools:
       - type: "function"
         function:
@@ -112,16 +112,16 @@ os-std:
 os-env_train:
   parameters:
     name: "os-env_train"
-    shuffle_seed: 45
+    shuffle_seed: 4444
     sample_size: 100
     # Enable harness for training-split iteration (test split stays untouched)
     enabled: true
     h2: true
-    h3: false
+    h3: true
     h4: true
     h5: true
     h5_top_k: 1
-    h5_score_threshold: 6.0
+    h5_score_threshold: 7.5
     data_config:
       files:
         - problem_file: data/os_interaction/train_0317/training.json

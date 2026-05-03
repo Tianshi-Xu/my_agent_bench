@@ -140,6 +140,7 @@ services:
       - ../src/server/harness:/app/src/server/harness
     environment:
       - OS_ENV_TRAIN_PARAMETERS_ENV_OPTIONS_NETWORK_NAME=agentbench-fc_default
+      - OS_TASK_IDS=${OS_TASK_IDS:-}
     deploy:
       mode: replicated
       replicas: 1

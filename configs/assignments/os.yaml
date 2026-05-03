@@ -11,8 +11,8 @@ assignments:
   - agent:
       - qwen3-4b-instruct
     task:
-      - os-env_train
-      # - os-std
+      # - os-env_train
+      - os-std
 
-output: "outputs/os/{TIMESTAMP}-no-h3"
+output: "outputs/os/{TIMESTAMP}-test-harness"
 trials: 1

@@ -274,11 +274,34 @@ class TaskError(enum.Enum):
 
 class TaskClient:
     def __init__(
-        self, name: str, controller_address: str = "http://localhost:5000/api", *_, **__,
+        self,
+        name: str,
+        controller_address: str = "http://localhost:5000/api",
+        *_,
+        task_ids=None,
+        **__,
     ) -> None:
         self.name = name
         self.controller_address = controller_address
+        self.task_ids = self._parse_task_ids(task_ids)
         print("TaskClient created: {} ({})".format(name, controller_address))
+
+    @staticmethod
+    def _parse_task_ids(task_ids):
+        if task_ids is None:
+            return None
+        if isinstance(task_ids, str):
+            raw_items = task_ids.replace(",", " ").split()
+        elif isinstance(task_ids, (list, tuple)):
+            raw_items = task_ids
+        else:
+            raw_items = [task_ids]
+        parsed = []
+        for item in raw_items:
+            if item is None or item == "":
+                continue
+            parsed.append(int(item))
+        return parsed or None
 
     def get_indices(self) -> List[SampleIndex]:
         result = requests.get(
@@ -286,7 +309,15 @@ class TaskClient:
         )
         if result.status_code != 200:
             raise AgentBenchException(result.text, result.status_code, self.name)
-        return result.json()
+        indices = result.json()
+        if self.task_ids is None:
+            return indices
+        # The controller's /get_indices reflects the worker's configured
+        # shuffle/sample window.  Explicit task ids are intended to override
+        # that window, so do not reject ids just because they are not present in
+        # the sampled list.  The worker will validate the actual id on
+        # /start_sample.
+        return list(self.task_ids)
 
     def get_concurrency(self) -> int:
         try:

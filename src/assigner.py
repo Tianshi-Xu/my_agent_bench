@@ -476,10 +476,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "--auto-retry", "-r", action="store_true", dest="retry"
     )
+    parser.add_argument(
+        "--task-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Run only these OS task ids, separated by spaces. "
+            "Example: --task-ids 10 36 147"
+        ),
+    )
     args = parser.parse_args()
 
     loader = ConfigLoader()
     config_ = loader.load_from(args.config)
+    if args.task_ids is not None:
+        assigned_tasks = {
+            task_name
+            for assignment in config_.get("assignments", [])
+            for task_name in (
+                assignment.get("task")
+                if isinstance(assignment.get("task"), list)
+                else [assignment.get("task")]
+            )
+        }
+        for task_name in assigned_tasks:
+            task_def = config_.get("definition", {}).get("task", {}).get(task_name)
+            if not isinstance(task_def, dict):
+                continue
+            if task_def.get("module") not in {
+                "src.client.TaskClient",
+                "src.server.tasks.os_interaction.OSInteraction",
+            }:
+                continue
+            params = task_def.setdefault("parameters", {})
+            params["task_ids"] = list(args.task_ids)
+            params.pop("sample_size", None)
+            params.pop("shuffle_seed", None)
     value = AssignmentConfig.parse_obj(config_)
     value = AssignmentConfig.post_validate(value)
     v = value.dict()
