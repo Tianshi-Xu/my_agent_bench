@@ -143,6 +143,7 @@ class WebShopHarnessConfig:
     # H5 skill retrieval
     h5_top_k: int = 2              # max skills injected at cold-start
     h5_cold_start_max_words: int = 50  # word cap per skill text
+    h5_score_threshold: float = 0.0  # min BM25 score; 0 = no threshold
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,77 +271,22 @@ _ALL_TASK_TYPES = [
 ]
 
 WEBSHOP_SKILLS: List[Dict[str, Any]] = [
+    # ── Tool-contract skills: non-obvious interface constraints ───────────────
+    # These address behaviors the model cannot infer from tool descriptions or
+    # real-time hints (H3/H4). Strategy skills that duplicate H3 (tool desc)
+    # or H4 (step guidance / attribute checklist) have been removed.
     {
-        "id": "select_all_attributes",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_TECH, TASK_TYPE_HOME],
-        "keywords": [
-            "color", "size", "select", "attribute", "option",
-            "click", "choose", "variant",
-        ],
-        "text": (
-            "On the product page, you MUST select ALL required attributes "
-            "(color, size, style variant) before clicking 'buy now'. "
-            "Check every attribute option on the page. "
-            "Missing even one attribute will result in a wrong purchase."
-        ),
-    },
-    {
-        "id": "brand_match",
+        "id": "price_slightly_over",
         "task_types": _ALL_TASK_TYPES,
         "keywords": [
-            "brand", "model", "specific", "exact", "name",
-            "manufacturer", "maker",
-            # Common instruction phrasing that implies brand-specific search
-            "find", "looking", "need", "want", "help",
+            "price", "budget", "over", "above", "exceed",
+            "expensive", "cost", "afford", "close", "lower", "dollars",
         ],
         "text": (
-            "The task mentions a specific brand or model name. "
-            "On the search results page, carefully read each product title "
-            "and click ONLY the product whose title contains the exact brand name. "
-            "A cheap generic alternative will score zero — brand match is critical."
-        ),
-    },
-    {
-        "id": "verify_product_type",
-        "task_types": [TASK_TYPE_FOOD, TASK_TYPE_BEAUTY, TASK_TYPE_GENERAL],
-        "keywords": [
-            "verify", "check", "confirm", "title", "description",
-            "product", "match", "correct", "right",
-        ],
-        "text": (
-            "Before clicking 'buy now', verify the product title matches the task. "
-            "A product may be cheap and have no attribute options, but still be "
-            "the WRONG product (e.g., shampoo instead of conditioner, "
-            "honey roasted instead of chocolate covered). "
-            "Go back to search if the product type doesn't match."
-        ),
-    },
-    {
-        "id": "search_keywords_strategy",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "search", "keywords", "query", "find", "look",
-            "results", "browse",
-        ],
-        "text": (
-            "When searching, use the product name and key features as keywords. "
-            "Do NOT include price, filler words, or full sentences. "
-            "Example: for 'waterproof blue hiking boots size 10 under $80', "
-            "search 'waterproof blue hiking boots size 10'. "
-            "If first search yields no match, try shorter or different keywords."
-        ),
-    },
-    {
-        "id": "buy_immediately_after_attrs",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "buy", "purchase", "complete", "done", "finish",
-            "buy now", "checkout", "immediately",
-        ],
-        "text": (
-            "After selecting all required attributes, click 'buy now' IMMEDIATELY. "
-            "Do NOT deliberate, explain your reasoning, or confirm — just buy. "
-            "Every turn spent NOT buying wastes your limited step budget."
+            "If a product is only slightly above budget (about 5%), buy it. "
+            "A near match is better than no purchase. Do not spend many turns hunting "
+            "for cheaper options that may not exist. Skip only clearly overpriced items "
+            "(for example above 20%)."
         ),
     },
     {
@@ -349,13 +295,14 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
         "keywords": [
             "light", "dark", "sky", "navy", "rose", "baby",
             "royal", "hot", "deep", "bright", "pale", "neon",
-            "blue", "green", "pink", "grey", "gray", "gold",
+            "fuchsia", "dusty", "salmon", "pearl", "champagne",
+            "wine", "maroon", "turquoise", "teal", "coral", "burgundy",
+            "charcoal", "aqua", "blue", "green", "pink", "grey", "gray", "gold",
         ],
         "text": (
-            "For compound colors like 'light blue', 'rose pink', 'sky blue', "
-            "'dark green': look for the FULL compound color option on the page. "
-            "If only a partial match exists (e.g., 'blue' when you need 'light blue'), "
-            "click the closest match — it may still score well."
+            "For compound colors like 'light blue' or 'fuchsia pink', first look for "
+            "an exact compound option. If only a partial option exists (for example "
+            "'blue'), choose the closest partial match instead of skipping color selection."
         ),
     },
     {
@@ -366,9 +313,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "size", "fit", "length",
         ],
         "text": (
-            "For sizes with fit modifiers like 'petite small' or 'tall large', "
-            "look for the combined option (e.g., 'small petite') rather than "
-            "just the base size. The combined option is the correct one."
+            "For sizes with fit modifiers (like 'petite small' or 'tall large'), "
+            "select the combined option (for example 'small petite'), not only "
+            "the base size."
         ),
     },
     {
@@ -379,10 +326,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "count", "piece", "gb", "tb", "ml", "liter",
         ],
         "text": (
-            "When the task specifies measurements (e.g., '8 ounce', '6.6 feet', "
-            "'32 gb'), look for these as selectable options on the product page. "
-            "They may appear in 'size' or 'other' option groups. "
-            "Select the correct measurement before buying."
+            "When the task specifies measurements (like '8 ounce', '6.6 feet', "
+            "or '32 gb'), select that value on the product page before buying. "
+            "It may appear under 'size' or another option group."
         ),
     },
     {
@@ -393,99 +339,10 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "honey", "sugar", "spice", "option", "pack",
         ],
         "text": (
-            "Food products often have flavor/variant options that must be selected. "
-            "Look for options matching the exact flavor or variant in the task "
-            "(e.g., 'honey roasted', 'dark chocolate', 'spearmint'). "
-            "These are clickable options, not just product description words."
-        ),
-    },
-    {
-        "id": "pagination_exploration",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "next", "page", "browse", "more", "results",
-            "scroll", "search", "again",
-        ],
-        "text": (
-            "If no product on the current search results page matches the task, "
-            "click 'next >' to see more results before re-searching. "
-            "The correct product may be on page 2 or 3."
-        ),
-    },
-    # ── Skills targeting agent behavioral failure patterns ─────────────────
-    {
-        "id": "back_to_search_on_mismatch",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "back", "search", "wrong", "mismatch", "different",
-            "return", "try", "another",
-        ],
-        "text": (
-            "If the product page title does NOT match the task description "
-            "(wrong product type, wrong brand, wrong category), "
-            "click 'back to search' IMMEDIATELY. Do not deliberate or explain — "
-            "just click 'back to search' and try a different product. "
-            "Search is NOT available on product pages; only 'back to search' works."
-        ),
-    },
-    {
-        "id": "no_repeat_after_selected",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_TECH, TASK_TYPE_HOME],
-        "keywords": [
-            "already", "selected", "repeat", "again", "same",
-            "clicked", "chosen", "done",
-        ],
-        "text": (
-            "Once you have selected an attribute (color, size, etc.) and the hint "
-            "confirms '[selected ✓]', do NOT click it again. "
-            "Move on to the next unselected attribute, or click 'buy now' if all "
-            "attributes are done."
-        ),
-    },
-    {
-        "id": "price_slightly_over",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "price", "budget", "over", "above", "exceed",
-            "expensive", "cost", "afford", "close",
-        ],
-        "text": (
-            "If a product is slightly above budget (within ~5%), buy it anyway — "
-            "a close match is better than no purchase. Do not waste turns searching "
-            "for a cheaper alternative that may not exist. "
-            "Only skip products that are significantly over budget (>20%)."
-        ),
-    },
-    {
-        "id": "read_search_titles_carefully",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": [
-            "title", "name", "read", "careful", "match",
-            "product", "select", "results", "correct",
-        ],
-        "text": (
-            "On the search results page, carefully read EVERY product title before clicking. "
-            "Choose the product whose title contains the most keywords from the task "
-            "(brand name, product type, key features). "
-            "Do NOT just click the first or cheapest product — title match is more "
-            "important than price."
-        ),
-    },
-    # ── v10 skills: specific, actionable patterns ──────────────────────────
-    {
-        "id": "multi_word_color_match",
-        "task_types": [TASK_TYPE_APPAREL, TASK_TYPE_HOME, TASK_TYPE_BEAUTY],
-        "keywords": [
-            "fuchsia", "sky", "navy", "royal", "baby", "hot",
-            "deep", "bright", "pale", "neon", "dusty", "salmon",
-            "pearl", "champagne", "wine", "maroon", "turquoise",
-            "teal", "coral", "burgundy", "charcoal", "aqua",
-        ],
-        "text": (
-            "If the task asks for a compound color like 'fuchsia pink' or "
-            "'sky blue' but the page only has 'pink' or 'blue', click the "
-            "partial match — it is the closest option. Do not skip color "
-            "selection just because the exact compound color isn't listed."
+            "Food items often require explicit flavor or variant selection. "
+            "Match the task wording as closely as possible (for example "
+            "'honey roasted' or 'dark chocolate'). Treat them as clickable options, "
+            "not just description text."
         ),
     },
     {
@@ -497,10 +354,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "assortment",
         ],
         "text": (
-            "Food and beauty products often have pack count options like "
-            "'pack of 1', 'pack of 3', '8 ounce (pack of 1)'. "
-            "You MUST click the option matching the quantity or size "
-            "in the task. These are selectable attributes, not just labels."
+            "Food and beauty products often have pack-count options such as "
+            "'pack of 1' or 'pack of 3'. Select the option that matches the required "
+            "quantity and size. These are real attributes, not labels."
         ),
     },
     {
@@ -512,10 +368,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "area", "window", "panel",
         ],
         "text": (
-            "For rugs, curtains, and posters, the page often has dimension "
-            "options like '3x5 feet', '6x9 feet', '16 x 24 in'. "
-            "Select the size option matching the task dimensions. "
-            "If the exact size is not available, pick the closest one."
+            "For rugs, curtains, and posters, pick the dimension option that matches "
+            "the task (for example '3x5 feet' or '16 x 24 in'). "
+            "If the exact size is unavailable, choose the closest one."
         ),
     },
     {
@@ -527,10 +382,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "sweatshirt", "pullover",
         ],
         "text": (
-            "Some product options have code prefixes like '01# black', "
-            "'#3 blue', 'a-04wine', 'v366-pink'. Ignore the code prefix — "
-            "match the COLOR or STYLE name after the code. For example, "
-            "if the task says 'black', click '01# black'."
+            "Some options include code prefixes like '01# black' or 'v366-pink'. "
+            "Ignore the code and match the color or style text after it. "
+            "If the task asks for black, selecting '01# black' is correct."
         ),
     },
     {
@@ -542,10 +396,9 @@ WEBSHOP_SKILLS: List[Dict[str, Any]] = [
             "extension", "extender", "dreadlock", "clip",
         ],
         "text": (
-            "If the exact attribute value from the task is not in the "
-            "options list, select the closest available match rather than "
-            "skipping attribute selection entirely. A partial match "
-            "(e.g., 'pink' for 'fuchsia pink') is better than no selection."
+            "If the exact attribute value is not available, choose the closest match "
+            "instead of leaving the attribute unselected. A good partial match "
+            "(for example 'pink' for 'fuchsia pink') is better than no selection."
         ),
     },
 ]
@@ -555,17 +408,19 @@ def retrieve_webshop_skills(
     task_type: str,
     query: str,
     top_k: int = 2,
+    score_threshold: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
     Two-layer skill retrieval for WebShop:
       1. Hard filter — keep only skills whose task_types include task_type.
       2. BM25 ranking — rank filtered candidates by relevance to query.
+      3. Score threshold — drop skills below score_threshold (0 = no threshold).
     Returns up to top_k results.
     """
     candidates = [s for s in WEBSHOP_SKILLS if task_type in s.get("task_types", [])]
     if not candidates:
         return []
-    if len(candidates) <= top_k:
+    if len(candidates) <= top_k and score_threshold <= 0.0:
         return candidates
     query_tokens = _bm25_tokenize(query)
     if not query_tokens:
@@ -573,6 +428,8 @@ def retrieve_webshop_skills(
     docs = [_skill_doc_tokens(s) for s in candidates]
     scores = _bm25_scores(query_tokens, docs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+    if score_threshold > 0.0:
+        ranked = [(sc, c) for sc, c in ranked if sc >= score_threshold]
     return [c for _, c in ranked[:top_k]]
 
 
@@ -983,6 +840,84 @@ def extract_price(observation: str) -> Optional[float]:
     return None
 
 
+# Attribute section headers as they appear in WebShop observations.
+# Options under these headers are assigned to the mapped group.
+_ATTR_COLOR_HDRS = frozenset({"color", "colours", "color name", "colour"})
+_ATTR_SIZE_HDRS  = frozenset({"size", "sizes"})
+_ATTR_OTHER_HDRS = frozenset({
+    "flavor", "flavors", "flavour", "flavours", "flavor name",
+    "scent", "scents", "fragrance",
+    "style", "styles",
+    "material", "materials",
+    "pattern", "patterns",
+    "configuration",
+    "option", "options",
+    "type", "format",
+})
+
+
+def _extract_attr_with_obs(
+    observation: str,
+    clickables: List[str],
+) -> Dict[str, List[str]]:
+    """Primary attribute extractor using observation section headers.
+
+    Parses '[SEP]'-delimited observation to detect section headers (e.g.
+    'color', 'size', 'flavor name') and assigns subsequent clickable items to
+    the correct group. This correctly handles compound names ('metallic gun
+    metal'), alphanumeric codes ('c08'), and slug-style names ('greenwithoutlogo')
+    that token-based classification misses.
+
+    Falls back to extract_attribute_options for any clickables not placed by
+    the observation parser (e.g. when the observation is truncated).
+    """
+    clickable_lower_map: Dict[str, str] = {c.lower(): c for c in clickables}
+    parts = [p.strip() for p in re.split(r'\[SEP\]', observation)]
+
+    result: Dict[str, List[str]] = {}
+    current_group: Optional[str] = None
+    assigned: set = set()  # lowercase clickable values placed by obs parsing
+
+    for part in parts:
+        pl = part.lower()
+        if not pl:
+            continue
+        # Navigation stops and page-level tokens end any open attribute section
+        if pl in _NAV_CLICKABLES or pl in ("webshop",) or pl.startswith("instruction:"):
+            current_group = None
+            continue
+        # Section header detection
+        if pl in _ATTR_COLOR_HDRS:
+            current_group = "color"
+            continue
+        if pl in _ATTR_SIZE_HDRS:
+            current_group = "size"
+            continue
+        if pl in _ATTR_OTHER_HDRS:
+            current_group = "other"
+            continue
+        # Assign this part to the current section if it is a clickable option
+        if current_group is not None and pl in clickable_lower_map:
+            result.setdefault(current_group, []).append(clickable_lower_map[pl])
+            assigned.add(pl)
+
+    # Fallback: classify any clickables not covered by observation parsing
+    unassigned = [
+        c for c in clickables
+        if c.lower() not in assigned
+        and c.lower() not in _NAV_CLICKABLES
+        and not re.fullmatch(r"[a-z0-9]{10}", c.lower())
+    ]
+    if unassigned:
+        fallback = extract_attribute_options(unassigned)
+        for group, opts in fallback.items():
+            for opt in opts:
+                if opt.lower() not in assigned:
+                    result.setdefault(group, []).append(opt)
+
+    return {k: v for k, v in result.items() if v}
+
+
 def extract_attribute_options(clickables: List[str]) -> Dict[str, List[str]]:
     """
     Classify non-navigation clickables into attribute categories.
@@ -1074,7 +1009,7 @@ def update_page_state(
             if asin not in state.asins_visited:
                 state.asins_visited.append(asin)
             state.selected_attributes = {}
-            state.attribute_options = extract_attribute_options(clickables)
+            state.attribute_options = _extract_attr_with_obs(observation, clickables)
             state.current_price = extract_price(observation)
             state._stall_asin = asin
             state._stall_turns = 0
@@ -1085,7 +1020,7 @@ def update_page_state(
             # the selected option is gone and we can't match it.
             pre_click_opts = {k: list(v) for k, v in state.attribute_options.items()}
 
-            new_opts = extract_attribute_options(clickables)
+            new_opts = _extract_attr_with_obs(observation, clickables)
             if new_opts:
                 state.attribute_options = new_opts
             # Track attribute selection using PRE-click options.
@@ -1154,8 +1089,9 @@ _H3_SEARCH_HINT = (
     "WebShop search ignores price; use the product name and key features only."
 )
 _H3_CLICK_HINT = (
-    "Click a product from results, select ALL required attributes "
-    "(color, size, etc.) that match the task description, then click 'buy now'."
+    "On a product page, select ALL required attributes (color, size, variant, etc.) "
+    "that match the task description BEFORE clicking 'buy now'. "
+    "Check each option group on the page; leave nothing unselected if the task specifies it."
 )
 
 
@@ -1378,15 +1314,15 @@ def _rank_search_results(
     scored.sort(key=lambda x: (x["price_ok"], x["score"]), reverse=True)
 
     best = scored[0]
-    if best["score"] == 0:
-        return None  # no keyword match, don't suggest
+    # Require at least 2 distinct task keywords to match before suggesting.
+    # A single-keyword match (e.g. only "moisturizer" for "buttercream scent
+    # moisturizer") is too weak to reliably identify the right product.
+    if best["score"] < 2:
+        return None
 
-    # Build suggestion
-    overlap_str = ", ".join(sorted(best["overlap"])[:5])
-    suggestion = (
-        f"Best match: click '{best['asin']}' — "
-        f"title matches [{overlap_str}]"
-    )
+    # Include the product title so the agent can verify the suggestion is correct.
+    title_preview = best["title"][:60].strip() if best["title"] else best["asin"]
+    suggestion = f"Best match on this page: '{title_preview}' — click '{best['asin']}'"
     if not best["price_ok"]:
         suggestion += " (WARNING: may exceed budget)"
 
@@ -1478,11 +1414,14 @@ def _product_title_check(
     overlap_ratio = overlap_count / len(item_nouns)
 
     # item_nouns is sorted longest-first, so item_nouns[0] is the most specific noun.
-    # Require it to be present (primary noun check) OR 40% overall overlap.
-    # This catches cases where a product page mentions a few generic task words
-    # (e.g. "home", "decor") but not the actual product category noun ("rug", "curtain").
+    # Warn only when BOTH conditions hold:
+    #   - primary noun (longest, most discriminative) is missing, AND
+    #   - overall overlap is below 50% (more than half the item nouns are missing).
+    # Using AND prevents false positives where the task phrase has multiple content
+    # words but the correct product page is missing one (e.g. "batteries remote control
+    # for tv" → a TV remote may lack "batteries" but has "remote" + "control" → 0.67).
     primary_noun_found = item_nouns[0] in product_portion
-    if not primary_noun_found or overlap_ratio < 0.40:
+    if not primary_noun_found and overlap_ratio < 0.50:
         missing = [w for w in item_nouns if w not in product_portion][:3]
         return (
             f"Harness: this product may not match the task category. "
@@ -1818,6 +1757,7 @@ class WebShopHarnessRuntime:
     # H2 state
     _last_click: Optional[str] = field(default=None)
     _repeat_click_count: int = field(default=0)
+    _total_buy_now_blocks: int = field(default=0)  # safety cap across all block reasons
 
     # H5 dedup
     _last_hint: Optional[str] = field(default=None)
@@ -1841,6 +1781,7 @@ class WebShopHarnessRuntime:
         self.force_next_action = None
         self._last_click = None
         self._repeat_click_count = 0
+        self._total_buy_now_blocks = 0  # safety cap across all block reasons
         self._defensive_buy_blocks = 0  # count defensive attr guard blocks
         self._product_mismatch_warned = False  # H4 flagged product mismatch
         self._mismatch_buy_blocks = 0  # times buy-now blocked after mismatch
@@ -1848,6 +1789,7 @@ class WebShopHarnessRuntime:
         self._last_hint_page = ""
         self._search_loop_resets = 0
         self._asin_stall_count = {}
+        self._price_warned_asins: set = set()  # ASINs already warned about price, to avoid repeat H4 loops
         self._h4_intervened = False  # set by post_step_monitor; suppresses H4-E on same turn
 
     # ── H5 cold-start ────────────────────────────────────────────────────────
@@ -1857,7 +1799,7 @@ class WebShopHarnessRuntime:
         H5 cold-start: two-layer skill retrieval.
           1. Filter WEBSHOP_SKILLS by task_type tag.
           2. BM25-rank filtered candidates against the raw instruction.
-          3. Return top-k (config.h5_top_k) skills, each capped at max_words.
+          3. Return top-k (config.h5_top_k) skills.
         """
         if not self.config.h5_enabled or self.requirements is None:
             return []
@@ -1865,12 +1807,11 @@ class WebShopHarnessRuntime:
             task_type=self.requirements.task_type,
             query=self.requirements.raw_instruction,
             top_k=self.config.h5_top_k,
+            score_threshold=self.config.h5_score_threshold,
         )
         result = []
         for skill in skills:
-            text = _truncate_to_word_budget(
-                skill["text"], self.config.h5_cold_start_max_words
-            )
+            text = skill["text"]
             result.append({
                 "id": skill["id"],
                 "text": text,
@@ -2024,6 +1965,11 @@ class WebShopHarnessRuntime:
         if state.page_type != PAGE_PRODUCT_DETAIL:
             return None
 
+        # Safety valve: after too many blocks this episode, let buy now through
+        # to prevent the agent from getting stuck in an infinite retry loop.
+        if self._total_buy_now_blocks >= 4:
+            return None
+
         to_click: List[str] = []
 
         # Color check (handles OR alternatives: e.g. "lavender or ivory")
@@ -2083,40 +2029,37 @@ class WebShopHarnessRuntime:
                     continue
                 to_click.append(f"click '{match}' for {spec_req}")
 
-        # Instruction-grounded option check: block buy-now if a page option is
-        # semantically grounded in the task instruction and not yet selected.
-        # IG matches from the same "other" group are mutually exclusive (radio
-        # buttons), so ANY ONE being selected satisfies the group requirement.
-        other_opts = state.attribute_options.get("other", [])
-        ig_matches = _instruction_grounded_matches(req, other_opts)
-        if ig_matches:
-            sel_other = state.selected_attributes.get("other", "").lower()
-            ig_any_selected = sel_other and any(
-                ig_opt.lower() in sel_other for ig_opt in ig_matches
-            )
-            if not ig_any_selected:
-                to_click.append(f"click '{ig_matches[0]}'")  # suggest best match
-
         # Defensive attribute guard: if any attribute group has options but
         # nothing is selected, block buy-now even if H0 didn't parse a
         # requirement for that group. This catches cases where the instruction
         # doesn't mention color/size but the product requires a selection.
-        # Allow through after 2 blocks to prevent infinite loops.
+        # Extends to "other" group (catches alphanumeric codes like "c08" and
+        # slug-style names like "greenwithoutlogo" when observation-based parsing
+        # places them correctly under "color", and also "other" variants).
+        # Allow through after 2 defensive blocks to prevent infinite loops.
         if not to_click and self._defensive_buy_blocks < 2:
-            unselected_groups = []
-            for group in ("color", "size"):
-                opts = state.attribute_options.get(group, [])
-                sel = state.selected_attributes.get(group, "")
-                if opts and not sel:
-                    unselected_groups.append((group, opts))
-            if unselected_groups:
-                self._defensive_buy_blocks += 1
-                for group, opts in unselected_groups:
-                    to_click.append(f"select a {group} (options: {', '.join(opts[:4])})")
+            any_selected = any(v for v in state.selected_attributes.values())
+            # Only fire defensive guard when agent hasn't selected ANY attribute yet.
+            # If any selection was made, trust the agent is on the right track.
+            if not any_selected:
+                unselected_groups = []
+                for group in ("color", "size"):
+                    opts = state.attribute_options.get(group, [])
+                    sel = state.selected_attributes.get(group, "")
+                    if opts and not sel:
+                        unselected_groups.append((group, opts))
+                other_def_opts = state.attribute_options.get("other", [])
+                if other_def_opts and not state.selected_attributes.get("other", ""):
+                    unselected_groups.append(("attribute", other_def_opts))
+                if unselected_groups:
+                    self._defensive_buy_blocks += 1
+                    for group, opts in unselected_groups:
+                        to_click.append(f"select a {group} (options: {', '.join(opts[:4])})")
 
         if not to_click:
             return None
 
+        self._total_buy_now_blocks += 1
         instructions = "; ".join(to_click[:3])
         return (
             f"You must select required attributes before buying. "
@@ -2220,18 +2163,23 @@ class WebShopHarnessRuntime:
             self._h4_intervened = True
             return response
 
-        # ② Price over budget (on product page)
+        # ② Price over budget (on product page) — fires at most once per ASIN to
+        # prevent repeat-fire loops (agent gets stuck between price-warn and
+        # search-block when search isn't available on product pages).
+        asin_for_price = state.current_asin or ""
         if (
             state.page_type == PAGE_PRODUCT_DETAIL
             and state.current_price is not None
             and req.price_max is not None
             and state.current_price > req.price_max * (1 + self.config.price_tolerance)
+            and asin_for_price not in self._price_warned_asins
         ):
+            self._price_warned_asins.add(asin_for_price)
             response["audit_reason"] = "price_over_budget"
             response["intervention_level"] = "soft"
             response["recovery_prompt"] = (
                 f"Harness: this product costs ${state.current_price:.2f} but your budget is "
-                f"${req.price_max:.0f}. Go back to search and find a cheaper option."
+                f"${req.price_max:.0f}. Click 'back to search' and find a cheaper option."
             )
             self._h4_intervened = True
             return response

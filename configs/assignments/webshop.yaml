@@ -2,10 +2,10 @@ import: definition.yaml
 
 concurrency:
   task:
-    webshop-env_train: 16
-    webshop-std: 16
+    webshop-env_train: 32
+    webshop-std: 32
   agent:
-    qwen3-4b-instruct: 16
+    qwen3-4b-instruct: 32
 
 assignments:
   - agent:
@@ -14,5 +14,5 @@ assignments:
       - webshop-env_train
       # - webshop-std
 
-output: "outputs/webshop/{TIMESTAMP}"
-trials: 5
+output: "outputs/webshop/{TIMESTAMP}-no-h3"
+trials: 1

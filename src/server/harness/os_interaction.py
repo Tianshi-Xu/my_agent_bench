@@ -1,5 +1,5 @@
 """
-OS Interaction Harness — H0/H1/H2/H3/H4/H5  (v5)
+OS Interaction Harness — H0/H1/H2/H3/H4/H5  (v7)
 
 H0  Task Parser            — one-time shell-task classification per episode
 H1  Shell & Conv State     — per-round bash history, output candidates, truncation flags
@@ -10,9 +10,56 @@ H2  Action Gate            — text-embedded tool-call rescue (JSON/kwarg/positi
 H3  Tool Description Patch — static shell strategy / tool-format hints
 H4  Post-step Monitor      — truncation / error / empty-output / loop + budget warn/force
                              (budget logic is part of H4 — single post-bash trigger)
-H5  Goal-directed Hint     — task-type-aware skill (BM25) + per-step guidance
+H5  Goal-directed Hint     — task-type-aware skill (BM25 + score threshold + context
+                             override) + per-step guidance
                              (lint only fires when no candidate exists to avoid over-correction;
                               submit hint suppressed when H4 has active recovery prompt)
+
+Architecture changes (v7 vs v6):
+  - H5 files_containing_pattern: removed TASK_COUNT_MATCHES — this skill says "Count FILES
+    (not lines)" which is actively wrong for count_matches tasks that count lines in files.
+    Kept only TASK_COUNT_FILES.  Fixes IDX 222/493/510/780/998 false injections.
+  - H5 home_dir_file_glob: restricted to [COUNT_FILES, COUNT_LINES] (removed COUNT_MATCHES,
+    COUNT_UNIQUE).  Replaced example "~/project_files" → "~/mysubdir" to prevent BM25
+    false-match against "project_logs" task descriptions (IDX 215 fix).
+  - H5 count_entries_by_date: removed generic keywords "entries"/"messages"/"records" —
+    these caused injection for ERROR-counting tasks with no date context (IDX 632).
+    Added "yyyy-mm" to reinforce date-specificity signal.
+  - H5 today_date_command: removed bare "date" from keywords (too generic, caused IDX 932
+    unique-ERROR task to receive this tip).  Changed text to remove "log file" phrase.
+  - H5 ip_status_extract: rewrote to lead with `head -3 FILE` advice and explicitly
+    recommend `awk '{print $1}'` when task says "each line starts with IP" — grep -oE
+    inflates count by matching IPs embedded in timestamps (IDX 524/577/859 pattern).
+  - H0 _detect_task_type: added pre-check for "how many files contain X" → TASK_COUNT_FILES
+    before the generic contain+count → TASK_COUNT_MATCHES rule, fixing misclassification of
+    IDX 215-style tasks ("how many log files contain the word ERROR").
+
+Architecture changes (v6 vs v5):
+  - H5 score threshold (h5_score_threshold=6.0): skills scoring below threshold are NOT
+    injected even if ranked #1 — prevents noisy low-relevance injections (IDX 426/663
+    had BM25=5.36 and were harmful; now blocked).
+  - H5 context-driven case_insensitive_hint override: when ctx.case_sensitive is False,
+    case_insensitive_hint is force-inserted into the top-k result even if a higher-scoring
+    skill won BM25 (fixes IDX 31/83/809 where "Ignore case" tasks got wrong skill).
+  - H5 _CASE_INSENS_SIGNALS extended with "ignore case" + regex fallback to detect
+    "Ignore case sensitivity" phrasing that was previously not parsed.
+  - H5 home_dir_file_glob keywords narrowed from ["home","txt","text","files",...] to
+    ["glob","wildcard","star","asterisk"] — skill was over-matching most home-dir file
+    tasks; H4's no_such_file recovery handles actual glob mistakes reactively.
+  - H5 case_insensitive_hint keywords: removed bare "case" (too generic, caused false
+    positives on unrelated unique-IP tasks).
+  - H4 _ERROR_RE extended with "invalid mode", "invalid option", "unrecognized option",
+    "find: warning:", "grep: warning:", "xargs: warning:" — catches IDX 788 pattern
+    where find returned "invalid mode" error but zero-nudge fired instead of error path.
+  - H4 zero-nudge (step_guidance): replaced "run `ls` to verify" with softer message
+    that does NOT instruct additional exploration (prevents cascading wrong-exploration
+    when 0 IS the correct answer, e.g. mtime-filter tasks like IDX 245).
+  - H4 verification window extended from round_num==0 to round_num<=1 (first two bash
+    calls both emit "verify before committing" rather than "submit it") — guards against
+    round-1 premature submission of wrong intermediate answers (IDX 952).
+  - H4 candidate_string_answer guard: rejects single-line outputs longer than 120 chars
+    or starting with tool-name prefixes (find:/grep:/ls: etc.) — prevents find: warning:
+    text from being promoted as the string answer (IDX 663).
 
 Architecture changes (v5 vs v4):
   - H5 round-0 submit hint changed to verification nudge: "you got 'N' on your first
@@ -127,6 +174,10 @@ class OSHarnessConfig:
     # H5
     h5_top_k: int = 2
     h5_cold_start_max_words: int = 50
+    # Minimum BM25 score for a skill to be injected.  Skills scoring below this
+    # threshold are not injected even if they are ranked #1 — prevents noisy
+    # low-relevance injections that confuse the agent.
+    h5_score_threshold: float = 6.0
 
     # H4 budget (thresholds used by post_step_monitor ⑦)
     h4_budget_warn_threshold: int = 3       # remaining <= N → soft warn
@@ -140,8 +191,28 @@ class OSHarnessConfig:
 # BM25 retrieval (for H5 cold-start)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Stopwords excluded from BM25 scoring — these appear in every task description
+# and every skill text, so they carry zero discriminative power and inflate scores
+# for skills that happen to share common English words with the query.
+# NOTE: domain terms like "file", "directory", "count" are NOT stopwords here —
+# they are discriminating for OS subtask types.  Only pure function words are
+# excluded.  Adding "task" prevents false match via "your task is to" phrasing.
+_BM25_STOPWORDS: set = {
+    "a", "an", "the", "in", "of", "for", "to", "is", "it", "at", "be", "as",
+    "with", "by", "from", "that", "this", "have", "has", "had", "do", "did",
+    "does", "we", "you", "your", "they", "are", "was", "were", "all", "any",
+    "not", "or", "and", "but", "if", "on", "so", "up", "can", "may", "how",
+    "what", "which", "when", "where", "who", "will", "would", "should", "could",
+    "each", "its", "into", "also", "than", "then", "there", "these", "those",
+    "some", "same", "other", "such", "only", "no", "more", "out", "across",
+    "use", "used", "using", "e", "g", "i", "s", "m", "d", "h", "n", "r",
+    "task",
+}
+
+
 def _bm25_tokenize(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", (text or "").lower())
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [t for t in toks if t not in _BM25_STOPWORDS]
 
 
 def _skill_doc_tokens(skill: Dict[str, Any]) -> List[str]:
@@ -239,7 +310,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "If the task mentions 'subdirectories' or 'recursively', use `find` "
             "(always recursive by default) or `grep -r`. Plain `ls` and `grep` "
-            "without `-r` do NOT descend into subdirectories."
+            "without `-r` do not descend into subdirectories."
         ),
     },
     {
@@ -258,7 +329,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "To count lines containing a pattern: `grep -rh PATTERN DIR --include='*.EXT' | wc -l`. "
             "For case-insensitive, add -i: `grep -rhi PATTERN DIR | wc -l`. "
-            "NEVER pipe `grep -c FILE` to `wc -l` — `grep -c` returns count *per file*; "
+            "Never pipe `grep -c FILE` to `wc -l` — `grep -c` returns a count per file; "
             "`wc -l` then counts files, not total matching lines."
         ),
     },
@@ -284,7 +355,9 @@ OS_SKILLS: List[Dict[str, Any]] = [
     {
         "id": "case_insensitive_hint",
         "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE, TASK_COUNT_LINES],
-        "keywords": ["ignoring", "case", "regardless", "case-insensitive", "insensitive"],
+        # "case" alone is too generic (appears in many unrelated tasks).  Only use
+        # specific multi-word tokens that strongly signal case-insensitive intent.
+        "keywords": ["ignoring", "regardless", "insensitive", "case-insensitive", "ignore case"],
         "text": (
             "Task says 'ignoring case' or 'regardless of case' → add `-i` to "
             "grep (`grep -i`) or use `find ... -iname` instead of `-name`."
@@ -345,18 +418,8 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "task_types": _ALL_TASK_TYPES,
         "keywords": ["answer", "format", "number", "count", "output"],
         "text": (
-            "When submitting the answer, call the `answer_action` tool with ONLY "
-            "the bare value (e.g. '5', not '5 files' or 'The answer is 5'). "
+            "Submit only the bare value (e.g. '5', not '5 files' or 'The answer is 5'). "
             "Counting tasks expect a plain integer."
-        ),
-    },
-    {
-        "id": "avoid_text_tool_calls",
-        "task_types": _ALL_TASK_TYPES,
-        "keywords": ["tool", "call", "finish", "answer", "submit"],
-        "text": (
-            "NEVER write `answer_action(...)` or `bash_action(...)` in plain text — "
-            "you MUST invoke the tool via a real function call. Plain text is rejected."
         ),
     },
     {
@@ -364,8 +427,8 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "task_types": _ALL_TASK_TYPES,
         "keywords": ["already", "have", "answer", "submit", "result"],
         "text": (
-            "If the last bash output already contains your answer, do NOT re-run "
-            "the same command — call `answer_action` with the value immediately."
+            "If the last bash output already contains your answer, do not re-run "
+            "the same command — submit your final answer immediately."
         ),
     },
     {
@@ -374,7 +437,30 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "keywords": ["truncate", "truncated", "long", "output", "large"],
         "text": (
             "If output is truncated, refine the command — add `| wc -l`, "
-            "`| head -20`, or a narrower filter. Do NOT re-run the same command."
+            "`| head -20`, or a narrower filter. Do not re-run the same command."
+        ),
+    },
+    {
+        "id": "grep_bracket_word_bug",
+        "task_types": _ALL_TASK_TYPES,
+        "keywords": ["error", "warning", "info", "debug", "pattern", "match", "word", "contain"],
+        "text": (
+            "Regex pitfall: `grep '[ERROR]'` is a character class matching E, R, or O — "
+            "NOT the word 'ERROR'. To match the literal string use `grep 'ERROR'` (no brackets). "
+            "Same applies to [WARNING], [INFO], [DEBUG] etc."
+        ),
+    },
+    {
+        "id": "today_date_command",
+        "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES, TASK_COUNT_UNIQUE, TASK_COUNT_FILES],
+        # Removed bare "date" from keywords: too generic, caused false injection for log tasks
+        # that mention dates in passing (IDX 932 unique-ERROR-message task was hit).
+        # Keep only strong "today"/"current date"/"this day" signals.
+        "keywords": ["today", "current date", "this day"],
+        "text": (
+            "When the task says 'today', get the actual date with `date +%Y-%m-%d` and use it in "
+            "your grep: `grep \"$(date +%Y-%m-%d)\" FILE | ...`. "
+            "Do not hardcode a specific past date — it may be the wrong day."
         ),
     },
     # ── v2 specialised skills (added after 2026-04-18 eval) ──────────────────
@@ -385,7 +471,7 @@ OS_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "For 'total size … human-readable', use `du -ch $(find DIR -type f -name '*.EXT') "
             "| tail -1 | awk '{print $1}'` — output is '50K' (integer, no decimal). "
-            "Do NOT use `printf \"%.1fK\"` — the evaluator needs int() parseable values."
+            "Do not use `printf \"%.1fK\"` — the evaluator expects int()-parseable values."
         ),
     },
     {
@@ -412,7 +498,11 @@ OS_SKILLS: List[Dict[str, Any]] = [
     },
     {
         "id": "files_containing_pattern",
-        "task_types": [TASK_COUNT_FILES, TASK_COUNT_MATCHES],
+        # ONLY for count_files: this skill says "Count FILES (not lines)" which is
+        # actively wrong for count_matches tasks (which count lines/matches, not files).
+        # Removed TASK_COUNT_MATCHES to prevent injection when tasks count LINES in files
+        # that contain a pattern (IDX 222/493/510/780/998 were harmed by wrong injection).
+        "task_types": [TASK_COUNT_FILES],
         "keywords": ["files", "containing", "include", "with", "mention", "word", "which"],
         "text": (
             "Count FILES (not lines) that contain a pattern: "
@@ -456,47 +546,115 @@ OS_SKILLS: List[Dict[str, Any]] = [
     # ── v5 specialised skills (added after 2026-04-19 v4 eval) ──────────────
     {
         "id": "lines_total_vs_excluding",
-        "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES],
-        "keywords": ["excluding", "except", "without", "not containing", "total", "all lines", "non-empty"],
+        # Narrow: only inject when the task involves EXCLUDING lines (grep -v).
+        # Removed "total"/"all lines" keywords — too broad and caused IDX 419
+        # (count lines CONTAINING pattern) to receive confusing "Total ALL lines: wc -l" tip.
+        "task_types": [TASK_COUNT_LINES],
+        "keywords": ["excluding", "except", "without", "not containing", "non-empty", "invert"],
         "text": (
-            "Total ALL lines: `wc -l FILE` or `find DIR -name '*.EXT' -exec cat {} + | wc -l`. "
-            "Lines CONTAINING pattern: `grep -rh PATTERN DIR | wc -l`. "
             "Lines EXCLUDING pattern: `grep -v PATTERN FILE | wc -l` (add -r for dirs). "
-            "Make sure to use grep -v (invert), NOT grep PATTERN, when task says 'excluding'."
+            "Lines CONTAINING pattern: `grep -rh PATTERN DIR | wc -l`. "
+            "Total ALL lines (no filter): `wc -l FILE` or `find DIR -exec cat {} + | wc -l`. "
+            "Use grep -v (invert) ONLY when the task says 'excluding' / 'except' / 'without'."
         ),
     },
     {
         "id": "date_pattern_extract",
-        "task_types": [TASK_COUNT_UNIQUE, TASK_COUNT_MATCHES, TASK_COUNT_LINES],
-        "keywords": ["date", "dates", "timestamp", "unique", "year", "day", "month", "yyyy", "log", "entry"],
+        # Only for UNIQUE-date counting tasks, NOT for count_matches or count_lines.
+        # IDX 944 (count entries in March 2023) is count_matches → uses simple grep, not this skill.
+        # IDX 274/419 were harmed by injecting this skill for non-unique-date tasks.
+        "task_types": [TASK_COUNT_UNIQUE],
+        "keywords": ["date", "dates", "timestamp", "unique dates", "distinct dates", "yyyy", "different dates"],
         "text": (
-            "To extract unique dates from log files: "
-            "`grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' ~/logs/*.log | sort -u | wc -l`. "
-            "NEVER grep for literal 'YYYY-MM-DD' or 'MM/DD/YYYY' — those are templates, "
-            "not real dates. Run `head -3 FILE` first to see the actual date format."
+            "Run `head -3 FILE` first to see the actual date format. "
+            "To count UNIQUE dates: `grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' FILE | sort -u | wc -l`. "
+            "Use `[0-9]` NOT `\\d` — grep -E does not support \\d (use `[0-9]` instead). "
+            "If the date is always the first field, `awk '{print $1}' FILE | sort -u | wc -l` is safer. "
+            "To count ENTRIES on a specific date (not unique dates): `grep 'YYYY-MM-DD' FILE | wc -l`."
         ),
     },
     # ── v4 specialised skills (added after 2026-04-19 eval) ──────────────────
     {
         "id": "home_dir_file_glob",
-        "task_types": [TASK_COUNT_LINES, TASK_COUNT_MATCHES, TASK_COUNT_FILES, TASK_COUNT_UNIQUE],
-        "keywords": ["home", "txt", "text", "files", "home directory", "glob"],
+        # Narrowed to COUNT_FILES and COUNT_LINES only: MATCHES and UNIQUE caused false
+        # injections for unrelated tasks (IDX 215 got this tip for a unique-error-counting
+        # task and ran the wrong path).  Example subdir renamed from "project_files" to
+        # "mysubdir" to prevent BM25 false-match against "project_logs" task descriptions.
+        "task_types": [TASK_COUNT_FILES, TASK_COUNT_LINES],
+        "keywords": ["glob", "wildcard", "star", "asterisk"],
         "text": (
-            "Never use `~/.*\\.EXT` regex in bash — shell glob expansion does not "
-            "work that way and produces 'No such file or directory'. "
-            "Instead: `find ~ -maxdepth 1 -name '*.EXT'` or "
-            "`grep -r --include='*.EXT' PATTERN ~`."
+            "Never use `~/.*\\.EXT` glob in bash — it produces 'No such file or directory'. "
+            "Use `find DIR -name '*.EXT'` instead, where DIR is the target path. "
+            "If the task specifies a subdirectory (e.g. '~/mysubdir'), use that full path — "
+            "NOT just `~` or `find ~ -maxdepth 1`."
         ),
     },
     {
         "id": "ip_status_extract",
         "task_types": [TASK_COUNT_UNIQUE],
-        "keywords": ["ip", "address", "status", "200", "404", "access", "unique", "log"],
+        # Extended keywords: add "ip"/"address" so this skill matches general IP extraction
+        # tasks, not just HTTP-specific ones.  The skill text now leads with the GENERIC
+        # approach before offering format-specific awk patterns.
+        # Removed "unique ip" — "unique" alone caused false BM25 matches against tasks
+        # asking for "unique error messages" (IDX 215/932), pushing out grep_bracket_word_bug.
+        "keywords": ["ip", "address", "addresses", "access", "http", "apache",
+                     "nginx", "web", "status", "200", "404", "request"],
         "text": (
-            "To count unique IPs with a specific HTTP status code: "
-            "`awk '$9==\"200\"{print $1}' FILE | sort -u | wc -l`. "
-            "Do NOT extract IPs first then grep for the status code — the status "
-            "code is NOT in the IP string, so that grep always returns 0."
+            "Run `head -3 FILE` to check structure before picking an approach. "
+            "When each IPv4 line STARTS with an IP (first field): "
+            "`awk '{print $1}' FILES | sort -u | wc -l` — preferred over grep -oE "
+            "which over-counts by matching partial sub-patterns. "
+            "Generic IPv4 extraction (IP anywhere): "
+            "`grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' FILES | sort -u | wc -l`. "
+            "Apache/nginx access logs (IP=$1, status=$9): "
+            "`awk '$9==\"200\"{print $1}' access.log | sort -u | wc -l`."
+        ),
+    },
+    # ── v6 specialised skills (added after 2026-04-26 v6 eval) ──────────────
+    {
+        "id": "atime_mtime_hint",
+        "task_types": [TASK_COUNT_FILES, TASK_SYSTEM_INFO],
+        "keywords": ["accessed", "access", "atime", "last access", "not been accessed",
+                     "access time", "last accessed", "last read"],
+        "text": (
+            "For files NOT ACCESSED in N days: `find DIR -type f -atime +N | wc -l` (atime = access time). "
+            "For files NOT MODIFIED in N days: `find DIR -type f -mtime +N | wc -l` (mtime = modify time). "
+            "These are DIFFERENT: `-atime` tracks reads, `-mtime` tracks writes. "
+            "Read the task carefully — 'accessed' → atime, 'modified/changed' → mtime."
+        ),
+    },
+    {
+        "id": "loc_count",
+        "task_types": [TASK_COUNT_LINES],
+        "keywords": ["code", "python", "java", "script", "source", "comments",
+                     "comment", "blank", "non-comment", "non-empty", "lines of code", "loc"],
+        "text": (
+            "To count non-comment/non-blank lines (lines of code): "
+            "`find DIR -type f -name '*.py' | xargs grep -vh '^[[:space:]]*#' | "
+            "grep -v '^[[:space:]]*$' | wc -l`. "
+            "The `-h` flag on grep suppresses filename prefixes so you count pure lines. "
+            "Use `[[:space:]]` not `\\s` — POSIX character classes work in grep -E, `\\s` does not."
+        ),
+    },
+    {
+        "id": "count_entries_by_date",
+        "task_types": [TASK_COUNT_MATCHES, TASK_COUNT_LINES],
+        # Removed generic keywords "entries"/"messages"/"records": too broad, caused false
+        # injection for ERROR-counting tasks (IDX 632) where no specific date is involved.
+        # Retained month names and explicit date phrases as the discrimination signal.
+        # Removed "yyyy-mm" — it matched log format strings like "[YYYY-MM-DD HH:MM:SS]"
+        # in tasks that mention date format without asking about a specific date (IDX 552).
+        "keywords": ["january", "february", "march", "april",
+                     "may", "june", "july", "august", "september", "october", "november", "december",
+                     "month", "specific date", "occurred", "happened", "on the date"],
+        "text": (
+            "To count log EVENTS on/in a specific date or month: "
+            "`grep 'YYYY-MM' FILE | wc -l` (for a month) or `grep 'YYYY-MM-DD' FILE | wc -l` (for a day). "
+            "Use simple grep with the date string — no regex needed for exact date matching. "
+            "Do NOT use grep -oE to extract dates when you want to COUNT lines, not extract values. "
+            "If the task asks for events on the MOST RECENT date (not a fixed date), first find "
+            "the latest date: `grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' FILE | sort | tail -1`, "
+            "then grep for that date."
         ),
     },
 ]
@@ -506,23 +664,27 @@ def retrieve_os_skills(
     task_type: str,
     query: str,
     top_k: int = 2,
-) -> List[Dict[str, Any]]:
-    """Two-layer retrieval: task_type filter + BM25 ranking against query."""
+    score_threshold: float = 0.0,
+) -> List[Tuple[float, Dict[str, Any]]]:
+    """Two-layer retrieval: task_type filter + BM25 ranking against query.
+
+    Returns list of (score, skill) tuples ranked by descending score.
+    Skills with score < score_threshold are excluded (pass 0.0 for no filter).
+    """
     candidates = [s for s in OS_SKILLS if task_type in s.get("task_types", [])]
     if not candidates:
         # Fallback to the always-on skills (tagged with every type)
         candidates = [s for s in OS_SKILLS if _ALL_TASK_TYPES[0] in s.get("task_types", [])]
     if not candidates:
         return []
-    if len(candidates) <= top_k:
-        return candidates
     query_tokens = _bm25_tokenize(query)
     if not query_tokens:
-        return candidates[:top_k]
+        ranked = [(0.0, c) for c in candidates[:top_k]]
+        return [(s, c) for s, c in ranked if s >= score_threshold]
     docs = [_skill_doc_tokens(s) for s in candidates]
     scores = _bm25_scores(query_tokens, docs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    return [c for _, c in ranked[:top_k]]
+    return [(s, c) for s, c in ranked[:top_k] if s >= score_threshold]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,6 +708,8 @@ _RECURSIVE_SIGNALS = [
 _CASE_INSENS_SIGNALS = [
     "ignoring case", "regardless of case", "case-insensitive",
     "case insensitive", "irrespective of case",
+    "ignore case",          # "Ignore case sensitivity when searching"
+    "case sensitivity",     # "Ignore case sensitivity" (with ignore/ignoring nearby)
 ]
 
 _MUTATION_VERBS = [
@@ -625,9 +789,23 @@ def _detect_task_type(desc: str) -> str:
         if re.search(r"\bcontain(?:ing)?\b|\bmatch(?:ing)?\b|\bwith\s+the\s+word\b", t):
             return TASK_COUNT_MATCHES
         return TASK_COUNT_LINES
+    # "how many/count files that contain X" → count_files, not count_matches.
+    # Must be checked BEFORE the generic contain+count → count_matches rule, which
+    # otherwise fires first and misclassifies file-counting tasks (e.g. IDX 215:
+    # "how many log files contain the word ERROR").
+    if re.search(r"\bhow\s+many\s+(?:\w+\s+){0,3}files?\b", t) and \
+       re.search(r"\bcontain(?:ing)?\b", t):
+        return TASK_COUNT_FILES
     if re.search(r"\bcontain(?:ing)?\b|\bmatch(?:ing)?\b", t) and re.search(r"\bcount|number\s+of|how\s+many\b", t):
         return TASK_COUNT_MATCHES
     if re.search(r"\bcount\b|\bnumber\s+of\b|\bhow\s+many\b", t) and re.search(r"\bfiles?\b|\bdirector(?:y|ies)\b|\bfolders?\b", t):
+        # "count entries/occurrences/errors in files" → TASK_COUNT_MATCHES, not TASK_COUNT_FILES
+        if re.search(
+            r"\bentries?\b|\boccurrences?\b|\binstances?\b|\blines?\b"
+            r"|\berrors?\b|\bwarnings?\b|\blevel\b|\blog\s+entries?\b",
+            t,
+        ):
+            return TASK_COUNT_MATCHES
         return TASK_COUNT_FILES
     # List / read
     if re.search(r"\blist\b.*\bfiles?\b", t):
@@ -712,9 +890,20 @@ def _detect_case_sensitivity(desc: str) -> Optional[bool]:
     t = desc.lower()
     for s in _CASE_INSENS_SIGNALS:
         if s in t:
+            # "case sensitivity" alone is ambiguous; require an ignore/insensitive
+            # verb nearby to avoid false positives on "case-sensitive" tasks.
+            if s == "case sensitivity":
+                if re.search(r"\b(ignor|insensitive|regardless|irrespective)\b", t):
+                    return False
+                continue
             return False
+    # Regex fallback: "ignore case" or "ignoring case" anywhere
+    if re.search(r"\bignor(?:e|ing)\s+case\b", t):
+        return False
     if "case-sensitive" in t or "case sensitive" in t:
-        return True
+        # Check it's not negated ("not case sensitive" / "case insensitive")
+        if not re.search(r"\b(not|in)\s*case.sensitive\b", t):
+            return True
     return None
 
 
@@ -772,6 +961,8 @@ class OSShellState:
     # v5: True when the previous round's post_step_monitor returned a recovery_prompt.
     # Used by the post-ls nudge to detect "H4 fired → agent ran ls → files found" pattern.
     h4_fired_last_round: bool = False
+    # Cumulative count of bash_loop detections (resets per episode via dataclass init).
+    bash_loop_count: int = 0
 
 
 _NUMERIC_LINE_RE = re.compile(r"^\s*(-?\d+)\s*$")
@@ -781,7 +972,9 @@ _GREP_C_LINE_RE = re.compile(r"^[^\s:]+:\d+$")
 _ERROR_RE = re.compile(
     r"(command not found|no such file or directory|permission denied|syntax error|"
     r"not a directory|paths must precede expression|unary operator expected|"
-    r"binary file .{0,40} matches|cannot open|bad substitution|ambiguous redirect)",
+    r"binary file .{0,40} matches|cannot open|bad substitution|ambiguous redirect|"
+    r"invalid mode|invalid option|unrecognized option|illegal option|"
+    r"find: warning:|grep: warning:|xargs: warning:)",
     re.IGNORECASE,
 )
 _TRUNC_MARK = "[truncated because the output is too long]"
@@ -851,14 +1044,27 @@ def bash_semantic_gaps(ctx: "OSTaskContext", bash: str) -> List[str]:
             gaps.append("task says 'ignoring case' — use `-iname` instead of `-name`")
     # Recursion mismatch
     if ctx.recursive is True:
-        recursive_tools = ("find", "grep -r", "grep -r ", "grep -rn", "grep -rh", "grep -rl", "grep -ri")
-        if not any(t in b for t in recursive_tools):
+        _has_recursive = "find" in b or bool(re.search(r"grep\s+-[a-zA-Z]*r[a-zA-Z]*", b))
+        if not _has_recursive:
             gaps.append("task mentions subdirectories — use `find` or `grep -r`, not plain `ls`/`grep`")
     if ctx.recursive is False and re.search(r"\bfind\b", b) and "-maxdepth" not in b:
         gaps.append("task says 'top directory only' — add `-maxdepth 1` to find")
     # -type f missing on count_files
     if ctx.task_type == TASK_COUNT_FILES and "find" in b and "-type f" not in b and "-type d" not in b:
         gaps.append("counting files — add `-type f` to exclude directories from the count")
+    # [WORD] character-class bug: grep '[ERROR]' matches single chars E/R/O, not the word
+    _bracket_word = re.search(r"grep\b[^|]*\[([A-Za-z]{2,})\]", bash)
+    if _bracket_word:
+        gaps.append(
+            f"'[{_bracket_word.group(1)}]' is a regex character class, not the word "
+            f"'{_bracket_word.group(1)}' — use `grep '{_bracket_word.group(1)}'` (no brackets)"
+        )
+    # xargs grep -r antipattern: -r makes grep recursive on file args from xargs — usually wrong
+    if "xargs" in b and re.search(r"grep\s+(?:-[a-zA-Z]*r[a-zA-Z]*\s|.*\s-r\b)", bash):
+        gaps.append(
+            "avoid `xargs grep -r` — xargs passes filenames so `-r` recurses inside each file path; "
+            "use `xargs grep` (no -r) or `grep -r PATTERN DIR` directly"
+        )
     return gaps
 
 
@@ -902,10 +1108,10 @@ def extract_numeric_candidates(text: str) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _H3_BASH_HINT = (
-    "Prefer one concise pipeline per turn. For counting files, use "
-    "`find DIR -type f ... | wc -l` (add `-type f` to exclude directories). "
-    "For counting unique values, pipe to `sort -u | wc -l`. "
-    "For matching lines, prefer `grep -c PATTERN FILE`."
+    "Use targeted, readable commands — break complex logic into multiple turns. "
+    "For counting files: `find DIR -type f -name '*.EXT' | wc -l` (always add `-type f`). "
+    "For counting matching lines: `grep -rh PATTERN DIR | wc -l`. "
+    "For unique values: pipe to `sort -u | wc -l`."
 )
 
 _H3_ANSWER_HINT = (
@@ -952,12 +1158,12 @@ _RESCUE_ANSWER_JSON_RE = re.compile(
 # Python-kwarg style: answer_action(answer='5') / answer_action(answer="5") — the
 # dominant failure mode on Qwen3-4B-Instruct (38/43 fails in 2026-04-18 eval).
 _RESCUE_ANSWER_KWARG_RE = re.compile(
-    r"answer_action\s*\(\s*answer\s*=\s*['\"]?([A-Za-z0-9_.+\-/]+?)['\"]?\s*\)",
+    r"answer_action\s*\(\s*answer\s*=\s*(?:['\"]([^'\"]{1,200})['\"]|([^\)\n]{1,120}))\s*\)",
     re.IGNORECASE,
 )
 # Positional form: answer_action(5) / answer_action('42.5MB') / answer_action("foo")
 _RESCUE_ANSWER_POSITIONAL_RE = re.compile(
-    r"answer_action\s*\(\s*['\"]?([A-Za-z0-9_.+\-/]{1,60})['\"]?\s*\)",
+    r"answer_action\s*\(\s*(?:['\"]([^'\"]{1,200})['\"]|([^\)\n]{1,120}))\s*\)",
     re.IGNORECASE,
 )
 # Bare "answer_action 60" (no parens) — only match a tight line-final token so
@@ -986,10 +1192,29 @@ _RESCUE_FINISH_KWARG_RE = re.compile(
 _REACT_ANSWER_RE = re.compile(r"Act:\s*answer\s*\(([^)]+)\)", re.IGNORECASE)
 _REACT_BASH_FENCE = re.compile(r"```bash\n(.*?)\n```", re.DOTALL)
 # Qwen3 OpenAI-JSON style: <tool_call>\n{"name":"bash_action","arguments":{...}}\n</tool_call>
+# MUST be greedy (.*) — the outer JSON has nested dicts (}} at the end), so non-greedy
+# .*? stops at the first } (inner dict) and produces incomplete JSON that json.loads rejects.
 _RESCUE_TOOL_CALL_XML_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    r"<tool_call>\s*(\{.*\})\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
+# Qwen3 writes bash grouping \( \) inside JSON strings, which is invalid JSON.
+# Convert invalid \X to \\X so json.loads sees a valid escaped backslash, and
+# the resulting parsed string retains \( as correct bash syntax.
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
+
+
+def _fix_json_escapes(s: str) -> str:
+    """Convert invalid JSON escapes (e.g. backslash-paren) to double-backslash form."""
+    return _INVALID_JSON_ESCAPE_RE.sub(r'\\\\\1', s)
+
+
+def _first_nonempty_match_group(m: re.Match) -> str:
+    """Return the first non-empty capture group from a regex match."""
+    for g in m.groups():
+        if g is not None and g != "":
+            return g
+    return m.group(0)
 
 
 def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
@@ -1009,7 +1234,7 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
     if m:
         try:
             import json as _json
-            obj = _json.loads(m.group(1))
+            obj = _json.loads(_fix_json_escapes(m.group(1)))
             name = obj.get("name", "")
             args = obj.get("arguments", {})
             if name in ("answer_action", "bash_action", "finish_action") and args:
@@ -1021,7 +1246,7 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
                 _RESCUE_ANSWER_POSITIONAL_RE, _RESCUE_ANSWER_BARE_RE):
         m = pat.search(content)
         if m:
-            val = m.group(1).strip().strip("'\"")
+            val = _first_nonempty_match_group(m).strip().strip("'\"")
             # Defend against picking up the literal token "answer" / "action"
             if val.lower() in {"answer", "action", "value"}:
                 continue
@@ -1168,27 +1393,34 @@ class OSHarnessRuntime:
     def cold_start_skill_hints(self) -> List[Dict[str, str]]:
         if not self.config.h5_enabled or self.task_ctx is None:
             return []
-        skills = retrieve_os_skills(
+        scored = retrieve_os_skills(
             task_type=self.task_ctx.task_type,
             query=self.task_ctx.raw_description,
             top_k=self.config.h5_top_k,
+            score_threshold=self.config.h5_score_threshold,
         )
-        # Always include the "avoid_text_tool_calls" skill if space remains —
-        # it's the highest-leverage skill against the dominant failure mode.
-        forced_id = "avoid_text_tool_calls"
-        have_ids = {s["id"] for s in skills}
-        if forced_id not in have_ids:
-            forced = next((s for s in OS_SKILLS if s["id"] == forced_id), None)
-            if forced is not None:
-                if len(skills) >= self.config.h5_top_k:
-                    skills = skills[: self.config.h5_top_k - 1] + [forced]
-                else:
-                    skills = skills + [forced]
-        result: List[Dict[str, str]] = []
-        for skill in skills:
-            text = _truncate_to_word_budget(
-                skill["text"], self.config.h5_cold_start_max_words
+        selected_skills: List[Dict[str, Any]] = [skill for _, skill in scored]
+
+        # Context-driven override: if the task is case-insensitive and
+        # case_insensitive_hint is not already in the results, force it in as
+        # the first skill (replacing the lowest-ranked result if at capacity).
+        # This prevents higher-scoring but less relevant skills from crowding
+        # out the most actionable tip for the agent.
+        if self.task_ctx.case_sensitive is False:
+            ci_skill = next(
+                (s for s in OS_SKILLS if s["id"] == "case_insensitive_hint"), None
             )
+            if ci_skill is not None:
+                already_in = any(s["id"] == "case_insensitive_hint" for s in selected_skills)
+                if not already_in:
+                    if len(selected_skills) >= self.config.h5_top_k:
+                        selected_skills[-1] = ci_skill   # replace lowest-ranked
+                    else:
+                        selected_skills.insert(0, ci_skill)
+
+        result: List[Dict[str, str]] = []
+        for skill in selected_skills:
+            text = skill["text"]
             result.append({
                 "id": skill["id"],
                 "text": text,
@@ -1279,9 +1511,19 @@ class OSHarnessRuntime:
             self.state.empty_output_streak = 0
         if self.state.last_output_numeric_candidates:
             self.state.candidate_numeric_answer = self.state.last_output_numeric_candidates[-1]
-        # Single-line string candidate (for largest/smallest tasks with filename answer)
+        # Single-line string candidate (for largest/smallest tasks with filename answer).
+        # Guard: reject lines that look like tool-error/warning messages or are so long
+        # that they can't be a real answer (filenames, dates, etc. are short).
         lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-        if len(lines) == 1 and not self.state.last_output_had_error:
+        if (
+            len(lines) == 1
+            and not self.state.last_output_had_error
+            and len(lines[0]) <= 120
+            and not re.match(
+                r"^(find|grep|ls|awk|sed|cat|wc|sort|uniq|head|tail|xargs|bash|sh)\s*[:\(]",
+                lines[0], re.IGNORECASE,
+            )
+        ):
             self.state.candidate_string_answer = lines[0]
         # Candidate health: mark implausible only for awk overflow / negative /
         # huge values.  The "zero on filter task" heuristic was removed after
@@ -1412,11 +1654,21 @@ class OSHarnessRuntime:
                 response["recovery_prompt"] = (
                     f"Harness: you have run the same command {self.config.h4_stall_window} times. "
                     f"The output already contains the answer ({st.candidate_numeric_answer}). "
-                    f"Call answer_action(answer='{st.candidate_numeric_answer}') now."
+                    f"Stop repeating — submit your final answer now."
                 )
             else:
+                st.bash_loop_count += 1
                 alt = self._first_turn_hint(ctx)
-                if alt:
+                # After 2+ loop detections with no candidate, force finish to break deadlock
+                if st.bash_loop_count >= 2:
+                    response["force_action"] = {
+                        "name": "finish_action",
+                        "arguments": {"thought": "Harness forced finish after repeated loop with no answer found."},
+                    }
+                    response["recovery_prompt"] = (
+                        "Harness: repeated loop detected with no answer. Terminating episode."
+                    )
+                elif alt:
                     response["recovery_prompt"] = (
                         "Harness: you are repeating the same command with no progress. "
                         "Try this instead — " + alt.removeprefix("Hint: ")
@@ -1424,7 +1676,7 @@ class OSHarnessRuntime:
                 else:
                     response["recovery_prompt"] = (
                         "Harness: you are repeating the same command. Try a different approach "
-                        "or submit the best answer you have with answer_action."
+                        "or submit the best answer you have."
                     )
             return _return(response)
 
@@ -1432,9 +1684,8 @@ class OSHarnessRuntime:
         if st.text_only_streak >= self.config.h2_text_only_streak_force:
             response["audit_reason"] = "text_only_streak"
             response["recovery_prompt"] = (
-                "Harness: you must call a tool. If you already have the answer, "
-                "call answer_action with just the value. Never embed "
-                "`answer_action(...)` in plain text — invoke the function."
+                "Harness: no tool call was detected. "
+                "You must call a tool — either run a bash command or submit your final answer."
             )
             return _return(response)
 
@@ -1501,8 +1752,8 @@ class OSHarnessRuntime:
                     and not st.candidate_implausible
                 ):
                     response["recovery_prompt"] = (
-                        f"[{rem} rounds left] Submit now: "
-                        f"answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"[{rem} rounds left] You have a candidate answer "
+                        f"({st.candidate_numeric_answer}). Submit it now."
                     )
                 elif st.candidate_implausible:
                     response["recovery_prompt"] = (
@@ -1512,7 +1763,7 @@ class OSHarnessRuntime:
                 else:
                     response["recovery_prompt"] = (
                         f"[{rem} rounds left] If you have a candidate answer, "
-                        "submit it immediately via answer_action."
+                        "submit it immediately."
                     )
 
         return _return(response)
@@ -1561,17 +1812,18 @@ class OSHarnessRuntime:
         # recovery prompt (h4_audit_active=True) so the two signals don't
         # conflict.  Also suppressed for implausible values (awk overflow, etc.).
         #
-        # Round-0 special case (v5): on the FIRST bash call (round_num==0,
-        # bash_history has exactly 1 entry), emit a verification nudge instead of
-        # a direct "submit" hint.  Analysis of v4 failures showed 22/35 were
-        # 1-shot wrong-command submissions: the agent ran a semantically wrong bash
-        # (wrong pattern, wrong path, missing -i), got a number, and immediately
-        # submitted because H5 said "submit 'N'".  The nudge asks the agent to
-        # re-read the task before committing to the answer.
+        # Rounds 0–1 verification window (v6): on the first TWO bash calls emit a
+        # verification nudge rather than a direct "submit" hint.  Analysis of v4
+        # failures showed 22/35 were 1-shot wrong-command submissions (v5 fixed
+        # those with round-0 nudge).  Remaining analysis shows similar premature
+        # submission on round-1 (agent refines command slightly, gets a number,
+        # immediately submits before verifying flags like -i).  Extending the
+        # verification window to round<=1 keeps the extra-check pressure without
+        # blocking the agent from submitting from round 2 onwards.
         #
-        # From round 1+, the original submit hint fires as before.
-        #
-        # candidate==0 always gets a verification nudge (regardless of round).
+        # Zero special case: replaced aggressive "run ls" with a softer hint that
+        # doesn't push the agent into further exploration (which causes wrong
+        # answers when the true count IS 0, e.g. "files modified in last N days").
         if not h4_audit_active:
             if hint is None and (
                 ctx.answer_shape == ANSWER_INTEGER
@@ -1580,25 +1832,28 @@ class OSHarnessRuntime:
                 and not st.answered
             ):
                 if st.candidate_numeric_answer == '0':
+                    # Soft zero-nudge: don't instruct the agent to run `ls` —
+                    # that triggers additional H4 empty/path-error cascades when
+                    # 0 is actually the correct answer (e.g. mtime filter tasks).
                     hint = (
-                        "Harness: result is 0. Before submitting, verify your path "
-                        "and filter are correct — run `ls` on the target directory to "
-                        "confirm it exists and has the expected files. "
-                        "If the answer truly is 0, call answer_action(answer='0')."
+                        "Harness: result is 0. If your path and filter are correct "
+                        "(right directory, right extension, time/size constraints), "
+                        "0 is a valid answer — submit it. Only re-check the command "
+                        "if you suspect the path or filter may be wrong."
                     )
-                elif round_num == 0 and len(st.bash_history) == 1:
-                    # First bash — ask the agent to verify before submitting.
+                elif round_num <= 1 and len(st.bash_history) <= 2:
+                    # First two bash calls — push for verification rather than
+                    # immediate submission to guard against premature wrong submissions.
                     hint = (
-                        f"Hint: you got '{st.candidate_numeric_answer}' from your first bash "
-                        f"command. Before submitting, re-read the task carefully and verify: "
-                        f"right directory? correct pattern? lines vs files? case-sensitive? "
-                        f"If confident, call answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"Hint: your first command returned '{st.candidate_numeric_answer}'. "
+                        f"Verify before committing: right directory? correct filter pattern? "
+                        f"case-sensitive match? counting lines not files? "
+                        f"Run a second command to confirm if unsure."
                     )
                 else:
                     hint = (
                         f"Hint: the last output contains the likely answer "
-                        f"'{st.candidate_numeric_answer}'. If that matches the task, call "
-                        f"answer_action(answer='{st.candidate_numeric_answer}')."
+                        f"'{st.candidate_numeric_answer}'. If that matches the task, submit it."
                     )
             # Suspicious-zero nudge when the candidate IS implausible
             elif hint is None and (
@@ -1622,8 +1877,7 @@ class OSHarnessRuntime:
                 and not st.last_output_had_error
             ):
                 hint = (
-                    f"Hint: if '{st.candidate_string_answer}' is the answer, call "
-                    f"answer_action(answer='{st.candidate_string_answer}')."
+                    f"Hint: if '{st.candidate_string_answer}' is the answer, submit it."
                 )
 
         # First-turn suggestion when no bash has been run yet (always allowed)

@@ -206,32 +206,33 @@ class ALFWorld(Task):
         harness_runtime = None
         if self.harness_config.enabled:
             harness_runtime = ALFWorldHarnessRuntime(self.harness_config)
-        session.inject(ChatCompletionSystemMessageParam(
-            role='system',
-            content=self.get_task_instruction()
-        ))
-
         initial_admissible = info.get('admissible_commands', [[]])[0]
         init_prompt = "Here is your task. " + ob + self.get_available_actions(initial_admissible)
         log_info["init_prompt"] = init_prompt
+        if harness_runtime:
+            # H0: parse task context and seed world model
+            harness_runtime.init_task(init_prompt, initial_admissible)
+
+        # H5 cold-start: gather per-task tips before sending the first system prompt.
+        cold_skills: list = []
+        if harness_runtime and self.harness_config.h5_enabled:
+            cold_skills = harness_runtime.cold_start_skill_hints()
+            for item in cold_skills:
+                log_info["harness_trace"]["h5"].append(item)
+
+        system_prompt = self.get_task_instruction()
+        if cold_skills:
+            skill_lines = "\n".join(f"- {item['text']}" for item in cold_skills)
+            system_prompt += f"\n\nSome tips that may help for this task:\n{skill_lines}"
+
+        session.inject(ChatCompletionSystemMessageParam(
+            role='system',
+            content=system_prompt
+        ))
         session.inject(ChatCompletionUserMessageParam(
             role='user',
             content=init_prompt
         ))
-        if harness_runtime:
-            # H0: parse task context and seed world model
-            harness_runtime.init_task(init_prompt, initial_admissible)
-        if harness_runtime and self.harness_config.h5_enabled:
-            # H5 cold-start: task-type-mapped skill hint (replaces BM25 retrieval)
-            cold_skills = harness_runtime.cold_start_skill_hints()
-            if cold_skills:
-                skill_lines = [f"- {item['text']}" for item in cold_skills]
-                session.inject(ChatCompletionUserMessageParam(
-                    role='user',
-                    content="Harness skill hints:\n" + "\n".join(skill_lines),
-                ))
-            for item in cold_skills:
-                log_info["harness_trace"]["h5"].append(item)
 
         # interact
         # Cache admissible commands from the previous env step so they are
@@ -396,15 +397,6 @@ class ALFWorld(Task):
                         "text": step_hint,
                         "token_cost": str(len(step_hint.split())),
                     })
-            if harness_runtime and self.harness_config.h3_enabled:
-                log_info["harness_trace"]["h3"].append(
-                    {
-                        "round": i + 1,
-                        "hint_applied": True,
-                        "token_cost": self.harness_config.h3_max_words,
-                    }
-                )
-
             # failure test
             if len(log_info["log"]) > 3:
                 pre_logs = log_info["log"][-3:]

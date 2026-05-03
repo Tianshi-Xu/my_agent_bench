@@ -205,7 +205,7 @@ DB_SKILLS: List[Dict[str, Any]] = [
         "task_types": list(_ALL_TASK_TYPES_LIST),
         "keywords": ["column", "name", "space", "dot", "backtick", "identifier", "quote"],
         "text": (
-            "Any table or column name with a space, dot, slash, or punctuation MUST be "
+            "Any table or column name with a space, dot, slash, or punctuation must be "
             "wrapped in backticks. Examples: `Race Name`, `No.`, `Olympic Medal Table`. "
             "Unquoted identifiers with spaces cause MySQL syntax errors."
         ),
@@ -266,7 +266,7 @@ DB_SKILLS: List[Dict[str, Any]] = [
         "text": (
             "For 'list all …' / 'show all the …' that expect multiple columns, prefer "
             "`SELECT * FROM `t` WHERE …;` and submit the DB output exactly as returned. "
-            "Do NOT re-format rows into sentences."
+            "Do not reformat rows into sentences."
         ),
     },
     {
@@ -286,6 +286,18 @@ DB_SKILLS: List[Dict[str, Any]] = [
             "For ranking: `SELECT `col` FROM `t` ORDER BY CAST(`num_col` AS SIGNED) DESC LIMIT 1;`. "
             "Cast the ORDER BY expression when the column is TEXT-typed numeric, otherwise "
             "you get '9' > '10' lexicographic order."
+        ),
+    },
+    {
+        "id": "rank_by_one_return_another",
+        "task_types": [TASK_RANKING, TASK_SELECT],
+        "keywords": ["where", "from", "which team", "which country", "name of", "first", "last", "earliest", "latest"],
+        "text": (
+            "When the question asks for an attribute of the top/first row (e.g., "
+            "'where was the first player transferred from'), sort by the ranking/date column "
+            "but SELECT the requested target column. Example: "
+            "`SELECT `From` FROM `t` ORDER BY `Date` ASC LIMIT 1;` "
+            "(not `SELECT `Date` ...`)."
         ),
     },
     {
@@ -319,12 +331,32 @@ DB_SKILLS: List[Dict[str, Any]] = [
         ),
     },
     {
+        "id": "insert_request_means_execute_insert",
+        "task_types": [TASK_INSERT],
+        "keywords": ["needs to be recorded", "add this incident", "add this entry", "new record", "record this", "append row"],
+        "text": (
+            "If the task asks to add/record a new entry, you must execute an INSERT. "
+            "A SELECT-only workflow is not enough. At most do one quick duplicate check, "
+            "then run the INSERT and verify the new row exists."
+        ),
+    },
+    {
         "id": "update_needs_where",
         "task_types": [TASK_UPDATE, TASK_DELETE],
         "keywords": ["update", "change", "set", "delete", "remove"],
         "text": (
             "ALWAYS include a WHERE clause on UPDATE/DELETE. A bare `UPDATE `t` SET …` "
             "modifies every row and the grading hash will never match."
+        ),
+    },
+    {
+        "id": "update_after_preview_same_filter",
+        "task_types": [TASK_UPDATE],
+        "keywords": ["for all", "update", "set to", "whose", "where", "consistency", "correct", "replace"],
+        "text": (
+            "For UPDATE tasks, a preview SELECT is optional, but you must execute UPDATE "
+            "with the same filter condition afterward. Do not commit after preview only. "
+            "Flow: preview target rows -> UPDATE ... WHERE same condition -> SELECT to verify."
         ),
     },
     {
@@ -363,7 +395,7 @@ DB_SKILLS: List[Dict[str, Any]] = [
         "task_types": [TASK_INSERT, TASK_UPDATE, TASK_DELETE],
         "keywords": ["insert", "update", "delete", "modify", "change", "commit"],
         "text": (
-            "INSERT/UPDATE/DELETE is scored by a table hash. You MUST actually run "
+            "INSERT/UPDATE/DELETE is scored by a table hash. You must actually run "
             "the mutation SQL successfully before calling commit_final_answer — "
             "committing without running the SQL fails the hash check."
         ),
@@ -373,18 +405,8 @@ DB_SKILLS: List[Dict[str, Any]] = [
         "task_types": list(_ALL_TASK_TYPES_LIST),
         "keywords": ["already", "have", "answer", "submit", "result", "done"],
         "text": (
-            "If your last query already returned the exact answer, do NOT re-run the "
+            "If your last query already returned the exact answer, do not re-run the "
             "same SQL. Call commit_final_answer immediately with that value."
-        ),
-    },
-    {
-        "id": "avoid_text_tool_calls",
-        "task_types": list(_ALL_TASK_TYPES_LIST),
-        "keywords": ["tool", "function", "call", "text", "response"],
-        "text": (
-            "NEVER write SQL or answers in plain text content. Always invoke "
-            "execute_sql / commit_final_answer via a real function call. "
-            "Plain text is ignored by the grader."
         ),
     },
     {
@@ -436,7 +458,8 @@ DB_SKILLS: List[Dict[str, Any]] = [
             "When the answer is a single total (e.g. 'how many X'), use a global aggregate "
             "WITHOUT GROUP BY: `SELECT COUNT(*) FROM `t` WHERE …;`. "
             "Adding GROUP BY returns one row per group, not a single total — you will "
-            "get many rows instead of one number."
+            "get many rows instead of one number. Do not use this pattern when the question "
+            "explicitly says 'for each', 'grouped by', or 'in each <category>'."
         ),
     },
     {
@@ -450,6 +473,17 @@ DB_SKILLS: List[Dict[str, Any]] = [
         ),
     },
     {
+        "id": "text_currency_numeric_compare",
+        "task_types": [TASK_SELECT, TASK_COUNTING, TASK_COMPARISON, TASK_RANKING],
+        "keywords": ["£", "$", "currency", "toll", "price", "above", "greater than", "at least"],
+        "text": (
+            "If numeric values contain currency symbols or commas (e.g., '£4.00', '$1,200'), "
+            "strip symbols before numeric comparison: "
+            "`CAST(REPLACE(REPLACE(`col`, '£', ''), ',', '') AS DECIMAL(20,6)) > 4.0`. "
+            "Do not compare such values as raw strings."
+        ),
+    },
+    {
         "id": "subquery_in_list",
         "task_types": [TASK_SELECT, TASK_COUNTING, TASK_COMPARISON],
         "keywords": ["not in", "exclude", "except", "without", "never", "no", "don't have"],
@@ -458,6 +492,17 @@ DB_SKILLS: List[Dict[str, Any]] = [
             "`SELECT * FROM `t` WHERE `col` NOT IN (SELECT `col` FROM `t2` WHERE …);`. "
             "For 'rows that DO appear' use IN. "
             "Watch out for NULL: `NOT IN (…)` returns no rows if the subquery contains NULL."
+        ),
+    },
+    {
+        "id": "next_previous_row_lookup",
+        "task_types": [TASK_SELECT, TASK_COMPARISON],
+        "keywords": ["next to", "next", "after", "following", "previous", "before", "adjacent", "neighbor"],
+        "text": (
+            "For 'next/previous row' questions, first find the anchor row key, then query the "
+            "adjacent row by an ordering column (id/rank/date). Example: "
+            "`SELECT ... FROM t WHERE id = (SELECT id FROM t WHERE name='X') + 1`. "
+            "Do not stop at returning the anchor row itself."
         ),
     },
     {
@@ -565,7 +610,7 @@ DB_SKILLS: List[Dict[str, Any]] = [
             "ALL columns are TEXT. INSERT values must be quoted strings matching "
             "the EXACT format in the table — including units ('100.0 m.'), ordinals ('2nd'), "
             "date strings ('October 23, 2005'), and score formats ('70-70-70=210'). "
-            "Do NOT use bare numbers (30) — use '30'. Check sample rows in the schema card."
+            "Do not use bare numbers (30) — use '30'. Check sample rows in the schema card."
         ),
     },
     {
@@ -576,6 +621,28 @@ DB_SKILLS: List[Dict[str, Any]] = [
             "Questions with 'grouped by X' / 'for each X' expect MULTI-ROW answers — "
             "one row per group. Use `SELECT X, COUNT(*) FROM tbl GROUP BY X` and commit "
             "ALL rows as tuple strings: answers=[\"('X1', 3)\", \"('X2', 1)\", ...]."
+        ),
+    },
+    {
+        "id": "unique_entity_with_related_values",
+        "task_types": [TASK_SELECT, TASK_COUNTING],
+        "keywords": ["unique", "appears only once", "each driver once", "list each", "with car numbers", "with values"],
+        "text": (
+            "If the question asks for one row per entity plus related values (e.g. "
+            "'each driver once with car numbers'), group by the entity and aggregate the "
+            "related field: `SELECT Driver, GROUP_CONCAT(DISTINCT `Car #`) FROM t ... "
+            "GROUP BY Driver ORDER BY Driver`. Do not return duplicated entity rows."
+        ),
+    },
+    {
+        "id": "update_with_dataset_average",
+        "task_types": [TASK_UPDATE],
+        "keywords": ["replace with average", "set to average", "update all rows where", "incorrectly recorded as 0", "average of all other"],
+        "text": (
+            "For UPDATE tasks that set bad rows to a dataset average, compute the average "
+            "from valid rows in a subquery and use it in UPDATE. Example: "
+            "`UPDATE t SET col=(SELECT ROUND(AVG(CAST(col AS DECIMAL(20,6)))) FROM t WHERE col!='0') "
+            "WHERE col='0';` then verify with SELECT."
         ),
     },
 ]
@@ -593,12 +660,70 @@ def retrieve_db_skills(
         return []
     if len(candidates) <= top_k:
         return candidates
+    q = (query or "").lower()
+
+    # Hard preferences for top-1 mode on high-conflict phrasings.
+    unique_entity_phrase = (
+        ("unique" in q and ("once" in q or "only once" in q))
+        or "each driver" in q
+        or "car number" in q
+    )
+    if unique_entity_phrase:
+        unique_skill = next((s for s in candidates if s.get("id") == "unique_entity_with_related_values"), None)
+        if unique_skill is not None and top_k == 1:
+            return [unique_skill]
+
+    # Grouped/per-category phrasing usually expects multi-row grouped outputs.
+    grouped_phrase = any(p in q for p in ["grouped by", "for each", "in each", "count by"])
+    if grouped_phrase:
+        grouped_skill = next((s for s in candidates if s.get("id") == "grouped_by_multi_row_answer"), None)
+        if grouped_skill is not None and top_k == 1:
+            return [grouped_skill]
+
     query_tokens = _bm25_tokenize(query)
     if not query_tokens:
         return candidates[:top_k]
     docs = [_skill_doc_tokens(s) for s in candidates]
     scores = _bm25_scores(query_tokens, docs)
-    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+
+    # Top-1 mode needs stronger disambiguation on high-conflict phrasings.
+    def heuristic_boost(skill_id: str) -> float:
+        boost = 0.0
+        if grouped_phrase and skill_id == "grouped_by_multi_row_answer":
+            boost += 6.0
+        if grouped_phrase and skill_id == "scalar_expect_one_row":
+            boost -= 3.0
+
+        if unique_entity_phrase:
+            if skill_id == "unique_entity_with_related_values":
+                boost += 2.0
+
+        if "update" in q and "average" in q and ("incorrectly" in q or "0" in q):
+            if skill_id == "update_with_dataset_average":
+                boost += 2.0
+
+        if any(p in q for p in ["next to", "next ", "previous", "before", "after", "adjacent"]):
+            if skill_id == "next_previous_row_lookup":
+                boost += 2.0
+
+        if any(sym in q for sym in ["£", "$", "currency", "toll", "price"]) and any(
+            p in q for p in ["above", "greater than", "at least", "over"]
+        ):
+            if skill_id == "text_currency_numeric_compare":
+                boost += 2.0
+
+        if any(p in q for p in ["needs to be recorded", "add this incident", "add this entry", "new record"]):
+            if skill_id == "insert_request_means_execute_insert":
+                boost += 2.0
+
+        return boost
+
+    adjusted = []
+    for score, skill in zip(scores, candidates):
+        sid = skill.get("id", "")
+        adjusted.append((score + heuristic_boost(sid), skill))
+
+    ranked = sorted(adjusted, key=lambda x: x[0], reverse=True)
     return [c for _, c in ranked[:top_k]]
 
 
@@ -634,6 +759,9 @@ def _detect_answer_shape(task_type: str, description: str) -> Optional[str]:
     if task_type in _MUTATION_TYPES:
         return SHAPE_HASH
     if task_type == TASK_COUNTING or task_type == TASK_AGG_COUNT:
+        # "how many X of each Y" / "for each Y" → GROUP BY → multi-row answer
+        if re.search(r"\bfor each\b|\bof each\b|\bper \w+\b|\bgrouped? by\b", t):
+            return SHAPE_MULTI_MULTI
         return SHAPE_SCALAR_INT
     if task_type == TASK_AGG_SUM or task_type == TASK_AGG_AVG:
         return SHAPE_SCALAR_FLOAT
@@ -834,6 +962,7 @@ class DBSessionState:
     mutation_commit_blocks_used: int = 0
     scalar_multi_answer_blocks_used: int = 0  # dedicated counter for scalar>1 blocks
     last_result_col_count: Optional[int] = None  # column count of last multi-col result
+    last_result_row_count: Optional[int] = None  # row count of last SQL result
     h4_fired_last_round: bool = False
 
 
@@ -1352,10 +1481,14 @@ def extract_candidate_from_response(response: str, answer_shape: Optional[str]) 
                     # the candidate (evaluator maps None → "0").
                     return "0", True
                 return str(v), False
-            # Multi-row but shape says scalar → take the first cell but mark implausible.
+            # Multi-row but shape says scalar → take the first cell.
+            # Only flag implausible when the agent returned MULTIPLE rows for a
+            # scalar-shape task; a single-row multi-col result is an exploratory
+            # query and should not trigger the "multi-row returned" H4 warning.
             try:
                 first_cell = parsed[0][0] if isinstance(parsed[0], tuple) else parsed[0]
-                return str(first_cell), True
+                is_implausible = len(parsed) > 1
+                return str(first_cell), is_implausible
             except Exception:
                 return None, False
 
@@ -1410,10 +1543,11 @@ _H3_SYSTEM_APPEND = (
     "backticks. A syntax error near a column name is almost always an "
     "un-backticked identifier. "
     "IMPORTANT: ALL columns are stored as TEXT — there are no INT/FLOAT columns. "
-    "For INSERT/UPDATE, values must be quoted strings that EXACTLY match the "
-    "existing data format (including units like '100.0 m.', ordinals like '2nd', "
-    "date strings like 'October 23, 2005'). Check the sample rows in the schema "
-    "card to see the expected format before writing INSERT/UPDATE statements."
+    "For INSERT/UPDATE, values must be quoted strings. Check the sample rows in "
+    "the schema card to determine the correct format for units (e.g. '100.0 m.'), "
+    "ordinals (e.g. '2nd'), and dates (e.g. 'October 23, 2005'). For pure numeric "
+    "values, use plain digits without thousands separators unless the sample rows "
+    "explicitly show commas (e.g. use '63000' not '63,000')."
 )
 
 
@@ -1478,20 +1612,9 @@ class DBBenchHarnessRuntime:
             query=self.task_ctx.raw_description,
             top_k=self.config.h5_top_k,
         )
-        forced_id = "avoid_text_tool_calls"
-        have_ids = {s["id"] for s in skills}
-        if forced_id not in have_ids:
-            forced = next((s for s in DB_SKILLS if s["id"] == forced_id), None)
-            if forced is not None:
-                if len(skills) >= self.config.h5_top_k:
-                    skills = skills[: self.config.h5_top_k - 1] + [forced]
-                else:
-                    skills = skills + [forced]
         result: List[Dict[str, str]] = []
         for skill in skills:
-            text = _truncate_to_word_budget(
-                skill["text"], self.config.h5_cold_start_max_words
-            )
+            text = skill["text"]
             result.append({
                 "id": skill["id"],
                 "text": text,
@@ -1859,6 +1982,7 @@ class DBBenchHarnessRuntime:
                     parsed_r = eval(resp_s, {"__builtins__": {}}, {})
                     if isinstance(parsed_r, list) and parsed_r and isinstance(parsed_r[0], tuple):
                         self.state.last_result_col_count = len(parsed_r[0])
+                        self.state.last_result_row_count = len(parsed_r)
                 except Exception:
                     pass
 
@@ -2152,14 +2276,16 @@ class DBBenchHarnessRuntime:
             and not st.candidate_implausible
             and st.sql_history
         ):
-            preview = str(st.candidate_answer)[:60]
             if ctx.answer_shape == SHAPE_MULTI_MULTI and st.last_result_col_count and st.last_result_col_count > 1:
+                row_note = f"{st.last_result_row_count} rows " if st.last_result_row_count else "rows "
                 hint = (
-                    f"Harness hint: last query returned `{preview}`. "
-                    f"Submit each ROW as one element (tuple repr): "
-                    f"answers=[\"('v1','v2')\", …]. Call commit_final_answer now."
+                    f"Harness hint: last query returned {row_note}with "
+                    f"{st.last_result_col_count} columns. Submit ALL rows — each as "
+                    f"one tuple-repr element: answers=[\"('v1','v2')\", …]. "
+                    f"Call commit_final_answer now."
                 )
             else:
+                preview = str(st.candidate_answer)[:60]
                 hint = (
                     f"Harness hint: last successful query returned `{preview}`. "
                     f"Submit the bare value(s) — no tuple brackets. "
@@ -2203,9 +2329,8 @@ class DBBenchHarnessRuntime:
                 and ctx.answer_shape in (SHAPE_SCALAR_INT, SHAPE_SCALAR_FLOAT, SHAPE_SCALAR_STR)
             ):
                 hint = (
-                    "Harness: multi-row returned but task expects a single value. "
-                    "Use COUNT(*), MAX/MIN, or add a more specific WHERE / LIMIT 1. "
-                    "Do NOT GROUP BY when a global total is expected."
+                    "Harness: multiple rows returned but task expects a single value. "
+                    "Use COUNT(*), MAX/MIN, or add a more specific WHERE / LIMIT 1."
                 )
 
         if hint is None:

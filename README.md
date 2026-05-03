@@ -18,4 +18,4 @@ pip install -r requirements.txt
   - 说明：redis controller必须启动，后面需要启动的容器取决于跑什么任务，例如上面是跑的alfworld的训练或测试任务。**注意，每次修改配置，都需要重新运行docker启动命令**。
   - 注意：webshop任务启动时间很长，即便docker显示启动了，还需等待数分钟才能运行任务，否则会提示找不到webshop容器，此时等待片刻再试一次就好。
 - 运行任务
-  - ```python -m src.assigner --config configs/assignments/alfworld_train.yaml```
+  - ```python -m src.assigner --config configs/assignments/alfworld.yaml```

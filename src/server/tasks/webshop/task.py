@@ -69,6 +69,7 @@ class WebShop(Task):
         h4 = configs.pop("h4", True)
         h5 = configs.pop("h5", True)
         h5_top_k = configs.pop("h5_top_k", 2)
+        h5_score_threshold = configs.pop("h5_score_threshold", 0.0)
         self.harness_config = WebShopHarnessConfig(
             enabled=bool(enabled),
             h2_enabled=bool(h2),
@@ -76,6 +77,7 @@ class WebShop(Task):
             h4_enabled=bool(h4),
             h5_enabled=bool(h5),
             h5_top_k=int(h5_top_k),
+            h5_score_threshold=float(h5_score_threshold),
         )
         if self.harness_config.enabled and self.harness_config.h3_enabled:
             tools = patch_webshop_tool_descriptions(tools)
@@ -122,26 +124,28 @@ class WebShop(Task):
         )
         try:
             env.reset(index)
-            session.inject(ChatCompletionSystemMessageParam(
-                role='system',
-                content=prompt_with_max_turn
-            ))
-
             # Harness: initialise per-episode runtime
             harness_runtime = None
+            cold_skills = []
             if self.harness_config.enabled:
                 harness_runtime = WebShopHarnessRuntime(config=self.harness_config)
                 harness_runtime.init_task(_extract_instruction(env.observation))
 
-            # H5 cold-start: inject skill hints BEFORE the first observation
+            # H5 cold-start: gather per-task tips before the first system message.
             if harness_runtime and self.harness_config.h5_enabled:
                 cold_skills = harness_runtime.cold_start_skill_hints()
-                if cold_skills:
-                    skill_lines = [f"- {item['text']}" for item in cold_skills]
-                    session.inject(ChatCompletionUserMessageParam(
-                        role='user',
-                        content="Shopping tips:\n" + "\n".join(skill_lines),
-                    ))
+
+            system_prompt = prompt_with_max_turn
+            if cold_skills:
+                skill_lines = [f"- {item['text']}" for item in cold_skills]
+                system_prompt += (
+                    "\n\nSome tips that may help for this task:\n"
+                    + "\n".join(skill_lines)
+                )
+            session.inject(ChatCompletionSystemMessageParam(
+                role='system',
+                content=system_prompt
+            ))
 
             action = None
             observation = env.observation

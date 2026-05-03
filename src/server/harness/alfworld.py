@@ -240,6 +240,24 @@ _SEARCH_PRIORITY: Dict[str, List[str]] = {
     "dishsponge":  ["sinkbasin", "cabinet", "countertop"],
     "glassbottle": ["cabinet", "countertop", "fridge"],
     "remotecontrol": ["sofa", "sidetable", "coffeetable", "ottoman"],
+    # Bedroom / living room objects missing from original list
+    "pillow":       ["bed", "sofa", "armchair", "ottoman", "sidetable"],
+    "vase":         ["shelf", "sidetable", "diningtable", "coffeetable"],
+    "laptop":       ["desk", "sidetable", "coffeetable"],
+    "watch":        ["sidetable", "drawer", "desk"],
+    "statue":       ["shelf", "sidetable", "diningtable"],
+    "candle":       ["sidetable", "shelf", "diningtable"],
+    "tissuebox":    ["sidetable", "coffeetable", "shelf", "countertop"],
+    "spraybottle":  ["cabinet", "countertop", "bathtubbasin"],
+    "ladle":        ["drawer", "countertop", "cabinet"],
+    "peppershaker": ["countertop", "cabinet", "diningtable"],
+    "saltshaker":   ["countertop", "cabinet", "diningtable"],
+    "scrubbrush":   ["sinkbasin", "bathtubbasin", "cabinet"],
+    "box":          ["shelf", "cabinet", "desk", "sidetable"],
+    "alarmclock":   ["sidetable", "desk", "shelf"],
+    "baseball":     ["desk", "shelf", "ottoman", "sidetable"],
+    "basketball":   ["ottoman", "sofa", "shelf"],
+    "tennisracket": ["shelf", "ottoman", "sidetable"],
 }
 _SEARCH_PRIORITY_DEFAULT = [
     "countertop", "cabinet", "shelf", "drawer",
@@ -412,7 +430,7 @@ class WorldModel:
                 # can still be detected as new targets.
                 if (target_type
                         and not self.target_found
-                        and target_type.lower() in obj
+                        and obj.split()[0] == target_type.lower()
                         and obj not in self.placed_items):
                     self.target_found = True
                     self.target_location = self.current_location
@@ -424,16 +442,29 @@ class WorldModel:
                 if loc not in self.visited and loc not in self.unvisited:
                     self.unvisited.append(loc)
 
+    # Locations that are very unlikely to contain any useful item.
+    # Kept as absolute last resort for navigation hints.
+    _DEPRIORITIZED_LOCS = ("garbagecan", "bathtubbasin", "toiletpaperhangerbox")
+
     def ordered_unvisited(self, target_type: str) -> List[str]:
-        """Unvisited locations sorted by commonsense priority for target_type."""
+        """Unvisited locations sorted by commonsense priority for target_type.
+
+        Locations that are extremely unlikely to contain any household item
+        (garbagecan, bathtubbasin) are ranked last so navigation hints
+        never suggest them unless no other option remains.
+        """
         priority = _SEARCH_PRIORITY.get(target_type.lower(), _SEARCH_PRIORITY_DEFAULT)
+        n_priority = len(priority)
 
         def rank(loc: str) -> int:
             ll = loc.lower()
             for i, p in enumerate(priority):
                 if ll.startswith(p):
                     return i
-            return len(priority)
+            # Push deprioritized locations past everything else
+            if any(ll.startswith(d) for d in WorldModel._DEPRIORITIZED_LOCS):
+                return n_priority + 100
+            return n_priority
 
         return sorted(self.unvisited, key=rank)
 
@@ -487,9 +518,20 @@ class WorldModel:
         No fallback: returning a wrong-destination put action causes the agent
         to place the item in the wrong receptacle, which then can't be undone
         and triggers a "Nothing happens" loop at the correct destination.
+
+        For pick_two_obj second cycle: prefer the exact same destination instance
+        used in the first cycle (e.g., countertop 1 rather than countertop 2).
         """
         if not self.inventory:
             return None
+        # Prefer previously-used destination locations (pick_two_obj consistency)
+        if self.placed_locations:
+            for prev_loc in self.placed_locations:
+                for a in admissible:
+                    if (a.startswith("put ")
+                            and dest_type.lower() in a.lower()
+                            and prev_loc.lower() in a.lower()):
+                        return a
         for a in admissible:
             if a.startswith("put ") and dest_type.lower() in a.lower():
                 return a
@@ -570,6 +612,23 @@ def _pick_forced_action(admissible: List[str], last_output: str) -> Optional[str
             continue
         return action
     return admissible[0] if admissible else None
+
+
+# H5 tool-contract mapping (module-level so it can't conflict with dataclass fields).
+# Maps task_type → the single tool-contract skill id to inject at cold-start.
+#
+# Empirical findings (Qwen3-4B, 100 episodes):
+#   - look_at_obj: "examine_plain_is_useless" caused small models to over-generalise
+#     "examine X with desklamp" into the search phase, triggering the 3-repeated-action
+#     terminator. H4 already has a reactive "examine_without_lamp" recovery prompt that
+#     handles this correctly without cold-start injection.
+#   - pick_cool/heat/clean: "take_before_visiting_appliance" changed agent search
+#     behaviour (opening every container) and altered search order in ways that exposed
+#     the world-model substring bug. H3 step sequence + H4 stall recovery cover both
+#     failure modes reactively and more precisely.
+# Both entries are removed; _H5_CONTRACT_MAP is kept as an extension point for future
+# task types or larger models where cold-start injection proves beneficial.
+_H5_CONTRACT_MAP: Dict[str, str] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -726,13 +785,15 @@ class ALFWorldHarnessRuntime:
                 "Always call take_action with exactly one action from AVAILABLE ACTIONS.",
                 self.config.h3_max_words,
             )
+        tt = self.task_ctx.target_type or "target"
+        dt = self.task_ctx.destination_type or "destination"
         hints = {
-            "pick_and_place":        "Prioritize: locate target → take → navigate to destination → put.",
-            "pick_two_obj":          "You can carry one item at a time. Deliver first, then collect second.",
-            "pick_clean_then_place": "Locate target → take → go to sinkbasin → clean → go to destination → put.",
-            "pick_heat_then_place":  "Locate target → take → go to microwave → heat → go to destination → put.",
-            "pick_cool_then_place":  "Locate target → take → go to fridge → cool → go to destination → put.",
-            "look_at_obj":           "Go to desklamp → use it → find target object → take it → examine with desklamp.",
+            "pick_and_place":        f"Find the {tt} → take it → go to {dt} → put it there.",
+            "pick_two_obj":          f"Carry one {tt} at a time. Put it in {dt}, then find the second {tt}.",
+            "pick_clean_then_place": f"Find the {tt} → take it → go to sinkbasin → clean it → go to {dt} → put it.",
+            "pick_heat_then_place":  f"Find the {tt} → take it → go to microwave → heat it → go to {dt} → put it.",
+            "pick_cool_then_place":  f"Find the {tt} → take it → go to fridge → cool it → go to {dt} → put it.",
+            "look_at_obj":           f"Find the desklamp → turn it on → find the {tt} → take it → examine {tt} with desklamp.",
         }
         hint = hints.get(self.task_ctx.task_type, hints["pick_and_place"])
         return _truncate_to_word_budget(hint, self.config.h3_max_words)
@@ -1086,28 +1147,30 @@ class ALFWorldHarnessRuntime:
 
     def cold_start_skill_hints(self) -> List[Dict[str, str]]:
         """
-        H5 cold-start: two-layer retrieval.
-          1. Filter ALF_SKILLS by task_type tag.
-          2. BM25-rank filtered candidates against the task goal string.
-          3. Return top-k (config.h5_top_k) skills, each capped at max_words.
+        H5 cold-start: inject one tool-contract skill for task types where the
+        model has a known interface-contract blind spot.
+
+        Design principle: H5 is PREVENTIVE (front-loads non-obvious constraints
+        before the agent can fail), not DUPLICATIVE (strategy already in H3/H4).
+        Only task types with a genuinely non-obvious action precondition get an
+        injection; simple placement tasks do not.
         """
         if not self.config.h5_enabled or self.task_ctx is None:
             return []
-        skills = retrieve_skills_for_task(
-            task_type=self.task_ctx.task_type,
-            query=self.task_ctx.task_goal,
-            top_k=self.config.h5_top_k,
-        )
-        result = []
-        for skill in skills:
-            text = _truncate_to_word_budget(skill["text"], self.config.h5_cold_start_max_words)
-            result.append({
-                "id": skill["id"],
-                "text": text,
-                "trigger": "cold_start",
-                "token_cost": str(len(text.split())),
-            })
-        return result
+
+        skill_id = _H5_CONTRACT_MAP.get(self.task_ctx.task_type)
+        if skill_id is None:
+            return []
+
+        skill = next((s for s in ALF_SKILLS if s["id"] == skill_id), None)
+        if skill is None:
+            return []
+
+        # Skill texts are curated offline; do not truncate at runtime.
+        # Keep full wording to avoid clipping key preconditions.
+        text = skill["text"]
+        return [{"id": skill_id, "text": text, "trigger": "cold_start",
+                 "token_cost": str(len(text.split()))}]
 
     def step_guidance(self, current_round: int, max_step: int, admissible: List[str]) -> Optional[str]:
         """
@@ -1207,11 +1270,36 @@ class ALFWorldHarnessRuntime:
 
         elif sg in (_SG_GOTO_DEST, _SG_PUT):
             put_a = world.find_put_action(dt, admissible)
-            if put_a:
+            # For pick_two_obj: both items must go to the SAME destination instance.
+            # If a put action is available but points to a different instance than
+            # where we placed the first item, redirect rather than endorsing it.
+            if (put_a and self.task_ctx
+                    and self.task_ctx.task_type == "pick_two_obj"
+                    and world.placed_locations):
+                prev_loc = world.placed_locations[0]
+                if prev_loc.lower() not in put_a.lower():
+                    # Wrong destination instance — steer agent to the correct one
+                    hint = (
+                        f"Hint: go to {prev_loc} to place the {world.inventory or tt} "
+                        f"— same spot as the first one."
+                    )
+                else:
+                    hint = f"Hint: place the {world.inventory or tt} — use: {put_a}."
+            elif put_a:
                 # Already at destination (or PUT is immediately available)
                 hint = f"Hint: place the {world.inventory or tt} — use: {put_a}."
             else:
-                hint = f"Hint: go to {dt} to place the {world.inventory or tt}."
+                # For pick_two_obj second cycle: navigate back to the SAME specific
+                # destination instance used for the first item, not just any matching type.
+                if (self.task_ctx and self.task_ctx.task_type == "pick_two_obj"
+                        and world.placed_locations):
+                    target_loc = world.placed_locations[0]
+                    hint = (
+                        f"Hint: go to {target_loc} to place the {world.inventory or tt} "
+                        f"— same spot as the first one."
+                    )
+                else:
+                    hint = f"Hint: go to {dt} to place the {world.inventory or tt}."
 
         elif sg == _SG_GOTO_LAMP:
             hint = "Hint: find the desklamp in this room and go to it."
@@ -1356,72 +1444,18 @@ def patch_take_action_tool_description(
 # ─────────────────────────────────────────────────────────────────────────────
 
 ALF_SKILLS: List[Dict[str, Any]] = [
+    # ── Tool-contract skills (injectable via H5) ──────────────────────────────
+    # These encode non-obvious preconditions that models miss from pretraining.
+    # H5 injects one of these at cold-start for task types with a known blind spot.
     {
-        "id": "pickup_then_deliver",
-        "task_types": ["pick_and_place", "pick_two_obj"],
-        "keywords": ["put", "place", "locate", "navigate", "deliver"],
-        "text": (
-            "For placement tasks: locate the target object, take it, "
-            "navigate directly to the destination receptacle, then put it there."
-        ),
-    },
-    {
-        "id": "state_changing_actions_only",
-        "task_types": ["pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place"],
-        "keywords": ["clean", "heat", "cool", "transform", "appliance"],
-        "text": (
-            "For transformation tasks: take the object to the required appliance "
-            "(sinkbasin/microwave/fridge), apply the transformation, "
-            "then deliver to the final destination."
-        ),
-    },
-    {
-        "id": "two_object_staging",
-        "task_types": ["pick_two_obj"],
-        "keywords": ["two", "both", "second", "pair", "another"],
-        "text": (
-            "You can carry one item at a time. Deliver the first object to the "
-            "destination before collecting the second."
-        ),
-    },
-    {
-        "id": "examine_with_lamp",
-        "task_types": ["look_at_obj"],
-        "keywords": ["examine", "lamp", "light", "desklamp", "look"],
-        "text": (
-            "First go to the desklamp and turn it on, then find the target object, "
-            "take it, and examine it with the desklamp."
-        ),
-    },
-    {
-        "id": "explore_unseen_first",
-        "task_types": [
-            "pick_and_place", "pick_two_obj",
-            "pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place",
-        ],
-        "keywords": ["find", "locate", "search", "explore", "unvisited"],
-        "text": (
-            "When searching, prefer unvisited containers and locations over "
-            "revisiting already-explored areas."
-        ),
-    },
-    {
-        "id": "break_loops_early",
-        "task_types": [],   # not used for cold-start; injected by H4 recovery only
-        "keywords": ["loop", "repeat", "stuck", "stall", "revisit"],
-        "text": (
-            "If recent actions revealed no new objects or progress, "
-            "switch to a different unexplored location immediately."
-        ),
-    },
-    {
-        "id": "appliance_is_midpoint_not_destination",
+        "id": "take_before_visiting_appliance",
         "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
-        "keywords": ["fridge", "microwave", "sinkbasin", "destination", "deliver", "after", "then"],
+        "keywords": ["carry", "hold", "inventory", "pick up", "before", "appliance"],
         "text": (
-            "The transformation appliance (fridge/microwave/sinkbasin) is a midpoint, "
-            "not the destination. After transforming the object, pick it up from the appliance "
-            "and carry it to the separate destination receptacle."
+            "You cannot clean, heat, or cool an item remotely. First pick up the exact target "
+            "object from the task (for example, do not confuse 'pot' with 'potato'), then carry "
+            "it to the required appliance (sink/microwave/fridge) and apply the transform action. "
+            "After transforming, go to the task destination and put that same transformed object there."
         ),
     },
     {
@@ -1429,43 +1463,101 @@ ALF_SKILLS: List[Dict[str, Any]] = [
         "task_types": ["look_at_obj"],
         "keywords": ["examine", "desklamp", "nothing special", "lamp", "with"],
         "text": (
-            "Plain 'examine X' says 'nothing special' and does NOT complete the task. "
-            "The only valid action is 'examine X with desklamp' while standing next to "
-            "a lit desklamp. Find the desklamp, turn it on, take the target object, "
-            "then use the exact 'examine X with desklamp' action."
+            "Plain 'examine X' only gives 'nothing special' and does not finish the task. "
+            "Use exactly 'examine X with desklamp' while standing next to a lit desklamp. "
+            "Turn on the lamp, take the target object, then run that exact examine action."
+        ),
+    },
+
+    # ── Strategy skills (NOT injectable via H5) ───────────────────────────────
+    # task_types=[] means retrieve_skills_for_task never returns them.
+    # H3 covers step sequence; H4 per-step guidance covers exploration and stall
+    # recovery reactively. Injecting these at cold-start duplicates H3/H4 and
+    # adds noise for small models — experiments showed no-H5 outperforms H5
+    # when only strategy skills are injected.
+    {
+        "id": "pickup_then_deliver",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["put", "place", "locate", "navigate", "deliver"],
+        "text": (
+            "For placement tasks, find the target, take it, go directly to the destination, "
+            "and place it there."
         ),
     },
     {
-        "id": "take_before_visiting_appliance",
-        "task_types": ["pick_cool_then_place", "pick_heat_then_place", "pick_clean_then_place"],
-        "keywords": ["carry", "hold", "inventory", "pick up", "before", "appliance"],
+        "id": "state_changing_actions_only",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["clean", "heat", "cool", "transform", "appliance"],
         "text": (
-            "You cannot transform an object remotely. You MUST pick up the target object "
-            "first, then carry it in your inventory to the appliance. Visiting the appliance "
-            "without holding the object accomplishes nothing."
+            "For transformation tasks, carry the item to the required appliance "
+            "(sinkbasin, microwave, or fridge), apply the transform action, then deliver it "
+            "to the final destination."
+        ),
+    },
+    {
+        "id": "two_object_staging",
+        "task_types": [],  # strategy — covered by H3 instance-specific hint
+        "keywords": ["two", "both", "second", "pair", "another"],
+        "text": (
+            "You can carry only one item at a time. Deliver the first object, then return to "
+            "find and deliver the second."
+        ),
+    },
+    {
+        "id": "examine_with_lamp",
+        "task_types": [],  # strategy — superseded by examine_plain_is_useless (tool contract)
+        "keywords": ["examine", "lamp", "light", "desklamp", "look"],
+        "text": (
+            "Go to the desklamp and turn it on first. Then find and take the target object, "
+            "and examine it with the desklamp."
+        ),
+    },
+    {
+        "id": "explore_unseen_first",
+        "task_types": [],  # strategy — covered by H4 navigation hints
+        "keywords": ["find", "locate", "search", "explore", "unvisited"],
+        "text": (
+            "When searching, prioritize unvisited locations and containers before revisiting "
+            "places you already checked."
+        ),
+    },
+    {
+        "id": "appliance_is_midpoint_not_destination",
+        "task_types": [],  # strategy — covered by H3; also wrong when dest IS an appliance
+        "keywords": ["fridge", "microwave", "sinkbasin", "destination", "deliver", "after", "then"],
+        "text": (
+            "The appliance (fridge, microwave, sinkbasin) is usually a midpoint, not the final "
+            "destination. After transforming the object, pick it up again and carry it to the "
+            "target receptacle."
         ),
     },
     {
         "id": "nothing_happens_means_wrong_state",
-        "task_types": [
-            "pick_and_place", "pick_two_obj",
-            "pick_clean_then_place", "pick_heat_then_place", "pick_cool_then_place",
-        ],
+        "task_types": [],  # strategy — H4 handles this reactively after the fact
         "keywords": ["nothing happens", "wrong", "state", "repeat", "fail", "stuck"],
         "text": (
-            "'Nothing happens' means the action is invalid for the current state — "
-            "the object may need to be held, transformed first, or the receptacle may "
-            "need to be opened. Do NOT repeat the same action; change your approach."
+            "'Nothing happens' means the action is invalid in the current state. You may need "
+            "to hold the item, transform it first, or open a receptacle. Do not repeat the same "
+            "action; change strategy."
         ),
     },
     {
         "id": "two_obj_second_item_different_location",
-        "task_types": ["pick_two_obj"],
+        "task_types": [],  # strategy — covered by H4 world model placed_items filter
         "keywords": ["second", "another", "two", "different", "source", "destination"],
         "text": (
-            "After delivering the first object, search for the second in unexplored locations. "
-            "Never pick up an object you just placed at the destination. "
-            "If the destination looks like a source location, confirm the item is a new one."
+            "After placing the first object, search unexplored locations for the second. Do not "
+            "pick up an item you already placed at the destination. If unsure, verify it is a "
+            "new instance before taking it."
+        ),
+    },
+    {
+        "id": "break_loops_early",
+        "task_types": [],  # not injectable; injected by H4 recovery only
+        "keywords": ["loop", "repeat", "stuck", "stall", "revisit"],
+        "text": (
+            "If recent actions reveal no new objects or progress, break the loop and switch to "
+            "a different unexplored location immediately."
         ),
     },
 ]

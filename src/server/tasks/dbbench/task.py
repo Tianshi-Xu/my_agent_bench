@@ -188,6 +188,17 @@ class DBBenchTask(Task):
             sys_prompt = SYSTEM_PROMPT
             if harness_runtime is not None and self.harness_config.h3_enabled:
                 sys_prompt = patch_dbbench_system_prompt(sys_prompt)
+
+            # ── H5 cold-start (append to initial system prompt) ───────────
+            cold_skills = []
+            if harness_runtime is not None and self.harness_config.h5_enabled:
+                cold_skills = harness_runtime.cold_start_skill_hints()
+                if cold_skills:
+                    skill_lines = [f"- {item['text']}" for item in cold_skills]
+                    sys_prompt += (
+                        "\n\nSome tips that may help for this task:\n"
+                        + "\n".join(skill_lines)
+                    )
             session.inject(ChatCompletionSystemMessageParam(role='system', content=sys_prompt))
 
             # ── User prompt + schema card (H_SCHEMA) ──────────────────────
@@ -203,15 +214,8 @@ class DBBenchTask(Task):
             user_prompt += "Question: " + entry["description"] + "\n"
             session.inject(ChatCompletionUserMessageParam(role='user', content=user_prompt))
 
-            # ── H5 cold-start ──────────────────────────────────────────────
+            # ── H5 trace ───────────────────────────────────────────────────
             if harness_runtime is not None and self.harness_config.h5_enabled:
-                cold_skills = harness_runtime.cold_start_skill_hints()
-                if cold_skills:
-                    skill_lines = [f"- {item['text']}" for item in cold_skills]
-                    session.inject(ChatCompletionUserMessageParam(
-                        role='user',
-                        content="Harness skill hints for this task:\n" + "\n".join(skill_lines),
-                    ))
                 for item in cold_skills:
                     harness_trace["h5"].append(item)
 
