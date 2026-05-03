@@ -26,7 +26,7 @@ qwen3-4b-instruct:
     import: "./openai-chat.yaml"
     parameters:
         name: "qwen3-4b-instruct"
-        url: "http://localhost:30000/v1/chat/completions"
+        url: "http://localhost:30005/v1/chat/completions"
         headers:
             Content-Type: "application/json"
             Authorization: "Bearer EMPTY"

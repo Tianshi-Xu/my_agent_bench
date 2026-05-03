@@ -5,6 +5,7 @@ __pycache__
 src/tasks/humaneval_x/env/vendor
 logs
 outputs
+outputs_old
 data/full
 results
 config.sh
