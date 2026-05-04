@@ -11,8 +11,8 @@ assignments:
   - agent:
       - qwen3-4b-instruct
     task:
-      - webshop-env_train
-      # - webshop-std
+      # - webshop-env_train
+      - webshop-std
 
-output: "outputs/webshop/{TIMESTAMP}-no-h3"
+output: "outputs/webshop/{TIMESTAMP}-test-harness"
 trials: 1

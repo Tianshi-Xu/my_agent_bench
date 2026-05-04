@@ -36,12 +36,12 @@ webshop-std:
     name: webshop-std
     start: 0
     end: 200
-    enabled: false
+    enabled: true
     h2: true
     h3: true
     h4: true
     h5: true
-    h5_top_k: 2
+    h5_top_k: 1
     h5_score_threshold: 3.0
 
 webshop-env_train:

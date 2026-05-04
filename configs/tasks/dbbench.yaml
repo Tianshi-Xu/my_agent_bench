@@ -62,7 +62,11 @@ dbbench-std:
     data_file: "data/dbbench/standard.jsonl"
     harness:
       enabled: true
-      h5_top_k: 3
+      h5_top_k: 1
+      h2: true              # action gate + SQL rewrite + commit gate + answer normalisation
+      h3: true              # tool/prompt static hints + schema card
+      h4: true              # post-step monitor + budget warn/force
+      h5: true              # skill library + step guidance
 
 dbbench-env_train:
   parameters:

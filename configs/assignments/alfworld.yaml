@@ -11,8 +11,8 @@ assignments:
   - agent:
       - qwen3-4b-instruct
     task:
-      # - alfworld-std
-      - alfworld-env_train
+      - alfworld-std
+      # - alfworld-env_train
 
 output: "outputs/alfworld/{TIMESTAMP}-harness"
 

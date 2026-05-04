@@ -12,6 +12,7 @@ assignments:
       - qwen3-4b-instruct
     task:
       - dbbench-env_train
+      - dbbench-std
 
 output: "outputs/dbbench/{TIMESTAMP}-harness"
 trials: 1

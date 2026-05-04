@@ -37,8 +37,8 @@ alfworld-std:
     h2: true
     h3: true
     h4: true
-    h5: false
-    h5_top_k: 3
+    h5: true
+    h5_top_k: 1
 
 alfworld-env_train:
   parameters:
