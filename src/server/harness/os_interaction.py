@@ -1392,10 +1392,17 @@ _REACT_BASH_FENCE = re.compile(r"```bash\n(.*?)\n```", re.DOTALL)
 # Qwen3 OpenAI-JSON style: <tool_call>\n{"name":"bash_action","arguments":{...}}\n</tool_call>
 # MUST be greedy (.*) — the outer JSON has nested dicts (}} at the end), so non-greedy
 # .*? stops at the first } (inner dict) and produces incomplete JSON that json.loads rejects.
+# Closer is optional: Qwen2.5-7B often emits `<tool_call>\n{...}` with no
+# `</tool_call>` and no trailing prose, which made the previous strict-closer
+# regex silently miss the call and the agent loop until task_limit_reached.
+# When the closer is missing we accept end-of-string (`\Z`); for messier cases
+# (e.g. trailing prose after the JSON) the brace-balanced fallback below
+# kicks in inside `rescue_tool_call_from_text`.
 _RESCUE_TOOL_CALL_XML_RE = re.compile(
-    r"<tool_call>\s*(\{.*\})\s*</tool_call>",
+    r"<tool_call>\s*(\{.*\})\s*(?:</tool_call>|\Z)",
     re.DOTALL | re.IGNORECASE,
 )
+_RESCUE_TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>", re.IGNORECASE)
 # Qwen3 writes bash grouping \( \) inside JSON strings, which is invalid JSON.
 # Convert invalid \X to \\X so json.loads sees a valid escaped backslash, and
 # the resulting parsed string retains \( as correct bash syntax.
@@ -1405,6 +1412,75 @@ _INVALID_JSON_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
 def _fix_json_escapes(s: str) -> str:
     """Convert invalid JSON escapes (e.g. backslash-paren) to double-backslash form."""
     return _INVALID_JSON_ESCAPE_RE.sub(r'\\\\\1', s)
+
+
+def _balanced_json_object(content: str, start: int) -> Optional[Tuple[int, int]]:
+    """Find the next balanced {...} JSON object at/after `start`.
+
+    Returns (begin, end) char offsets so content[begin:end] is the JSON dict,
+    or None if no balanced object is found.  Respects double-quoted strings
+    with backslash escapes — `{` / `}` inside strings do not affect depth.
+    """
+    n = len(content)
+    i = start
+    while i < n and content[i] != '{':
+        i += 1
+    if i >= n:
+        return None
+    begin = i
+    depth = 0
+    in_str = False
+    esc = False
+    while i < n:
+        c = content[i]
+        if esc:
+            esc = False
+        elif c == '\\':
+            esc = True
+        elif in_str:
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return (begin, i + 1)
+        i += 1
+    return None
+
+
+def _rescue_tool_call_balanced(content: str) -> Optional[Dict[str, Any]]:
+    """Fallback for <tool_call> blocks the strict regex misses.
+
+    Triggered for two real-world Qwen patterns the closing-tag regex couldn't
+    handle even after relaxing the closer:
+      1. trailing prose after the JSON (no </tool_call>): `<tool_call>{...}\nNote: ...`
+      2. malformed escapes that defeat greedy backtracking
+    Uses brace-balanced extraction so nested `{...}` inside `arguments` is
+    handled correctly.  Returns the parsed call dict or None.
+    """
+    m = _RESCUE_TOOL_CALL_OPEN_RE.search(content)
+    if not m:
+        return None
+    span = _balanced_json_object(content, m.end())
+    if span is None:
+        return None
+    try:
+        import json as _json
+        obj = _json.loads(_fix_json_escapes(content[span[0]:span[1]]))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name", "")
+    args = obj.get("arguments", {})
+    if name in ("answer_action", "bash_action", "finish_action") and args:
+        return {"name": name, "arguments": args}
+    return None
 
 
 def _first_nonempty_match_group(m: re.Match) -> str:
@@ -1439,6 +1515,14 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
                 return {"name": name, "arguments": args}
         except Exception:
             pass
+    # Brace-balanced fallback — covers the Qwen2.5-7B "no closing tag" case
+    # (and trailing-prose variants) that the regex above misses.  Without
+    # this fallback, IDX 12 / similar episodes loop until task_limit_reached
+    # because every assistant turn is text-only and H2 silently no-ops.
+    if "<tool_call>" in content.lower():
+        rescued = _rescue_tool_call_balanced(content)
+        if rescued:
+            return rescued
     # answer_action — try strict → loose
     for pat in (_RESCUE_ANSWER_JSON_RE, _RESCUE_ANSWER_KWARG_RE,
                 _RESCUE_ANSWER_POSITIONAL_RE, _RESCUE_ANSWER_BARE_RE):
@@ -2092,12 +2176,28 @@ class OSHarnessRuntime:
         # answer to a wrong one).
         if st.bash_history and not st.answered:
             gaps = bash_semantic_gaps(ctx, st.bash_history[-1])
+            # Strong gaps are only objective high-confidence command bugs that
+            # would yield a wrong count regardless of the candidate value:
+            # wrong file scope (extension / recursion), wrong case-handling,
+            # broken regex syntax, off-by-N counters.  Stylistic / advisory
+            # gaps (e.g. "use du -ch | grep total" instead of manual
+            # byte-to-KB conversion) are NOT included here — they fall back to
+            # the no-candidate-only path so that a plausible candidate the
+            # agent already has is not overridden by fragile advice.
+            # IDX 124 (Llama, total .txt KB) regressed because the
+            # "human-readable disk usage" hint forced a `du -ch | grep total`
+            # rewrite that produced per-file totals (`-exec ... {} \;` runs
+            # du once per file), turning a correct candidate `0` into wrong `4`.
             strong_gap = next(
                 (
                     g for g in gaps
                     if "`\\d`" in g
                     or "didn't filter by" in g
-                    or "case-insensitive matching" in g
+                    or "ignoring case" in g               # added: this is the dominant
+                    or "case-insensitive matching" in g   # case-insensitive gap text;
+                    # the whitelist previously matched only the rarer (1115) variant,
+                    # so the common (1106/1108) "ignoring case" gap silently fell
+                    # through and never overrode a candidate.
                     or "task mentions subdirectories" in g
                     or "grepping a directory" in g
                     or "`find -path`" in g
@@ -2109,7 +2209,12 @@ class OSHarnessRuntime:
                     or "beginning of each line" in g
                     or "top directory only" in g
                     or "number of files from `find`" in g
-                    or "human-readable disk usage" in g
+                    # removed: "human-readable disk usage" — the suggested
+                    # `du -ch ... | grep total` rewrite breaks under
+                    # `-exec ... {} \;` (du runs once per file) and
+                    # turned a correct candidate `0` into `4` on Llama
+                    # IDX 124 (total .txt KB).  Stylistic hint; let
+                    # candidate-promotion handle it instead.
                     or "date field includes brackets" in g
                     or "slashes inside an awk regex" in g
                     or "discards the date field" in g
@@ -2180,14 +2285,31 @@ class OSHarnessRuntime:
                         "if you suspect the path or filter may be wrong."
                     )
                 elif round_num <= 1 and len(st.bash_history) <= 2:
-                    # First two bash calls — push for verification rather than
-                    # immediate submission to guard against premature wrong submissions.
-                    hint = (
-                        f"Hint: your first command returned '{st.candidate_numeric_answer}'. "
-                        f"Verify before committing: right directory? correct filter pattern? "
-                        f"case-sensitive match? counting lines not files? "
-                        f"Run a second command to confirm if unsure."
-                    )
+                    # First two bash calls — only push for verification when
+                    # the command itself looks suspect (semantic gaps detected).
+                    # When the command is clean and produced a plausible
+                    # candidate, prefer the direct submit hint: forcing a
+                    # second-look on already-correct 1-shot answers regresses
+                    # models that one-shot well (Llama-3.1-8B IDX 14: model
+                    # ran the right `find ... | wc -l`, got `2`, then under
+                    # the verification nudge ran `xargs ls -l` and finally
+                    # called `finish_action` with prose instead of submitting
+                    # `2`).  Models that need the safety net (Qwen-style
+                    # buggy commands) keep getting the verification nudge
+                    # because their commands surface gaps.
+                    suspect = bool(bash_semantic_gaps(ctx, st.bash_history[-1]))
+                    if suspect:
+                        hint = (
+                            f"Hint: your first command returned '{st.candidate_numeric_answer}'. "
+                            f"Verify before committing: right directory? correct filter pattern? "
+                            f"case-sensitive match? counting lines not files? "
+                            f"Run a second command to confirm if unsure."
+                        )
+                    else:
+                        hint = (
+                            f"Hint: the last output contains the likely answer "
+                            f"'{st.candidate_numeric_answer}'. If that matches the task, submit it."
+                        )
                 else:
                     hint = (
                         f"Hint: the last output contains the likely answer "

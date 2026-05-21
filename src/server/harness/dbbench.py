@@ -33,6 +33,7 @@ H4 false-positive avoidance notes (per user warning):
   - Commit gate will only *block* a submission once per task to avoid dead-lock.
 """
 
+import ast
 import copy
 import json
 import math
@@ -1005,6 +1006,343 @@ _RESCUE_TOOL_CALL_XML_OPEN_RE = re.compile(
 # Partial answers list: capture all fully-quoted strings from a truncated JSON list.
 _RESCUE_PARTIAL_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
+# xLAM-style bracket-list tool calls.
+#   JSON form:    [{"name": "execute_sql", "arguments": {"query": "..."}}]
+#                 (also accepts "args" / "parameters" as field aliases)
+#   Python form:  [execute_sql(query='SELECT ... WHERE x="a"')]
+#                 [commit_final_answer(answers=['a','b'])]
+_RESCUE_PY_CALL_HEAD_RE = re.compile(
+    r"^\s*\[\s*(execute_sql|commit_final_answer)\s*\(",
+    re.IGNORECASE,
+)
+_RESCUE_PY_KWARG_RE = re.compile(r"\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$", re.DOTALL)
+_VALID_TOOL_NAMES = {"execute_sql", "commit_final_answer"}
+
+
+def _find_matching_bracket(s: str, start: int) -> int:
+    """Return index of ']' matching the '[' at position `start`, honouring
+    string literals so brackets inside quotes don't unbalance the count.
+    Returns -1 if no match.
+    """
+    if start >= len(s) or s[start] != "[":
+        return -1
+    depth = 0
+    in_str: Optional[str] = None
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _find_matching_paren(s: str, start: int) -> int:
+    """Return index of ')' matching the '(' at position `start`."""
+    if start >= len(s) or s[start] != "(":
+        return -1
+    depth = 0
+    in_str: Optional[str] = None
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _normalize_rescued_args(name: str, args: Any) -> Optional[Dict[str, Any]]:
+    """Coerce parsed args dict/list into the canonical {query: ...} or
+    {answers: [...]} shape expected by task.py."""
+    if isinstance(args, str):
+        # Some emitters double-encode arguments as a JSON string.
+        try:
+            args = json.loads(args)
+        except Exception:
+            pass
+    if name == "execute_sql":
+        if isinstance(args, dict):
+            for key in ("query", "sql", "statement"):
+                if key in args and isinstance(args[key], str):
+                    return {"query": args[key]}
+            # Fallback: take first string-valued field.
+            for v in args.values():
+                if isinstance(v, str):
+                    return {"query": v}
+        elif isinstance(args, str):
+            return {"query": args}
+    elif name == "commit_final_answer":
+        if isinstance(args, dict):
+            for key in ("answers", "answer", "result"):
+                if key in args:
+                    val = args[key]
+                    if isinstance(val, list):
+                        return {"answers": [str(x) for x in val]}
+                    if val is not None:
+                        return {"answers": [str(val)]}
+        elif isinstance(args, list):
+            return {"answers": [str(x) for x in args]}
+        elif isinstance(args, str):
+            return {"answers": [args]}
+    return None
+
+
+def _try_rescue_bracket_list(content: str) -> Optional[Dict[str, Any]]:
+    """Rescue xLAM-style bracket-list tool calls (JSON or Python-call form).
+
+    Field-name aliases: arguments / args / parameters. We only emit a rescue
+    when the call name is one of the two real tools — guards against
+    false-positives like `[{"Year": "1958", ...}]` (table-row echoing).
+    """
+    if not content:
+        return None
+    s = content.lstrip()
+    if not s.startswith("["):
+        return None
+
+    # ── 1) JSON-list form ────────────────────────────────────────────────
+    end = _find_matching_bracket(s, 0)
+    if end > 0:
+        try:
+            arr = json.loads(s[: end + 1])
+        except Exception:
+            arr = None
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            first = arr[0]
+            name = first.get("name") or first.get("tool") or first.get("function")
+            if isinstance(name, str) and name in _VALID_TOOL_NAMES:
+                raw_args = (
+                    first.get("arguments")
+                    if "arguments" in first
+                    else first.get("args")
+                    if "args" in first
+                    else first.get("parameters")
+                )
+                if raw_args is None:
+                    raw_args = {}
+                normalised = _normalize_rescued_args(name, raw_args)
+                if normalised is not None:
+                    return {"name": name, "arguments": normalised}
+
+    # ── 1b) Malformed JSON-list fallback ─────────────────────────────────
+    # xLAM frequently emits broken JSON like
+    #   [{"name":"commit_final_answer","arguments":{"answers":["..."}}]
+    # (forgets to close the inner `]`). Extract via tolerant regex when the
+    # head clearly says it's a tool call.
+    head = re.match(
+        r'^\s*\[\s*\{\s*["\']name["\']\s*:\s*["\']([A-Za-z_]\w*)["\']',
+        s,
+    )
+    if head:
+        name = head.group(1)
+        if name in _VALID_TOOL_NAMES:
+            if name == "commit_final_answer":
+                items = _try_rescue_partial_commit(s)
+                if items:
+                    return {
+                        "name": name,
+                        "arguments": {"answers": [str(x) for x in items]},
+                    }
+            elif name == "execute_sql":
+                qm = re.search(
+                    r'["\'](?:query|sql|statement)["\']\s*:\s*"((?:[^"\\]|\\.)*)"',
+                    s,
+                )
+                if qm:
+                    sql = qm.group(1).encode().decode(
+                        "unicode_escape", errors="ignore"
+                    )
+                    return {"name": name, "arguments": {"query": sql}}
+
+    # ── 2) Python-call form: [execute_sql(query=...)] ────────────────────
+    m = _RESCUE_PY_CALL_HEAD_RE.match(s)
+    if not m:
+        return None
+    name = m.group(1).lower()
+    paren_open = m.end() - 1  # index of '('
+    paren_close = _find_matching_paren(s, paren_open)
+    if paren_close < 0:
+        return None
+    payload = s[paren_open + 1 : paren_close].strip()
+    if not payload:
+        return None
+
+    # Try to parse as a single kwarg (kw=VALUE). xLAM nearly always emits
+    # exactly one keyword arg here.
+    kw_m = _RESCUE_PY_KWARG_RE.match(payload)
+    val: Any = None
+    if kw_m:
+        raw_val = kw_m.group(2).strip().rstrip(",").strip()
+        try:
+            val = ast.literal_eval(raw_val)
+        except Exception:
+            # Last-ditch: strip outer matched quotes.
+            if (
+                len(raw_val) >= 2
+                and raw_val[0] in ("'", '"')
+                and raw_val[-1] == raw_val[0]
+            ):
+                val = raw_val[1:-1]
+            else:
+                val = None
+    else:
+        # No `=`: treat the whole payload as a positional literal.
+        try:
+            val = ast.literal_eval(payload)
+        except Exception:
+            val = None
+
+    if val is None:
+        return None
+    normalised = _normalize_rescued_args(name, val)
+    if normalised is None:
+        return None
+    return {"name": name, "arguments": normalised}
+
+
+# xLAM-70B harness mode learns the harness's `[SCHEMA HINT]` bracket convention
+# in-context and emits free-text section markers like
+#   [Thoughts] reasoning ...
+#   [SQL] UPDATE `tbl` SET ...
+#   [Final Answer] X
+# Recognise these and lift them into real tool calls.
+_SECTION_SQL_MARKERS = frozenset({
+    "execute_sql", "sql", "sql query", "sql code", "verification sql",
+    "operation", "code", "execution", "tool call",
+})
+_SECTION_COMMIT_MARKERS = frozenset({
+    "commit_final_answer", "commit",
+    "final answer", "final_answer", "final",
+    "answer", "answers",
+})
+_SECTION_HEAD_RE = re.compile(r"\[\s*([A-Za-z][A-Za-z _]{0,30}?)\s*\]\s*")
+_SECTION_FENCE_RE = re.compile(
+    r"^```(?:[A-Za-z0-9_+-]+)?\s*\n?(.*?)\n?```\s*$", re.DOTALL
+)
+_SECTION_COMMIT_CALL_RE = re.compile(
+    r"^\s*commit_final_answer\s*\(\s*(.+?)\s*\)\s*$", re.DOTALL | re.IGNORECASE
+)
+
+
+def _strip_outer_code_fence(s: str) -> str:
+    s = s.strip()
+    m = _SECTION_FENCE_RE.match(s)
+    return m.group(1).strip() if m else s
+
+
+def _section_extract_sql(body: str) -> Optional[str]:
+    body = _strip_outer_code_fence(body)
+    if not body:
+        return None
+    # If body contains an inner ```sql ... ``` fence, prefer that.
+    inner = re.search(r"```sql\s*\n(.*?)\n```", body, re.DOTALL | re.IGNORECASE)
+    if inner:
+        return inner.group(1).strip() or None
+    return body
+
+
+def _section_extract_answers(body: str) -> Optional[List[str]]:
+    body = _strip_outer_code_fence(body)
+    if not body:
+        return None
+    # commit_final_answer(...) call wrapped in section body.
+    m = _SECTION_COMMIT_CALL_RE.match(body)
+    if m:
+        try:
+            val = ast.literal_eval(m.group(1))
+            if isinstance(val, list):
+                return [str(x) for x in val]
+            if isinstance(val, (str, int, float)):
+                return [str(val)]
+        except Exception:
+            pass
+    # Bare list literal.
+    if body.startswith("["):
+        try:
+            val = ast.literal_eval(body)
+            if isinstance(val, list):
+                return [str(x) for x in val]
+        except Exception:
+            pass
+    # Fallback: whole body is one answer.
+    return [body]
+
+
+def _try_rescue_section_marker(content: str) -> Optional[Dict[str, Any]]:
+    """Rescue free-text section-marker tool calls (xLAM-70B harness pattern).
+
+    Strategy: split content on `[marker]` heads, then take the LAST section
+    whose marker is in our action whitelist. Commit and SQL markers compete
+    on emission order — the latest one wins (matches model intent).
+    """
+    if not content or "[" not in content:
+        return None
+    matches = list(_SECTION_HEAD_RE.finditer(content))
+    if not matches:
+        return None
+
+    # Build (marker, body) for every section so unknown markers still
+    # delimit body extents correctly.
+    sections: List[Tuple[str, str]] = []
+    for i, m in enumerate(matches):
+        marker = m.group(1).strip().lower()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        body = content[body_start:body_end].strip()
+        sections.append((marker, body))
+
+    last_action: Optional[Tuple[str, str]] = None
+    for marker, body in sections:
+        if not body:
+            continue
+        if marker in _SECTION_SQL_MARKERS:
+            last_action = ("sql", body)
+        elif marker in _SECTION_COMMIT_MARKERS:
+            last_action = ("commit", body)
+
+    if last_action is None:
+        return None
+    kind, body = last_action
+
+    if kind == "sql":
+        sql = _section_extract_sql(body)
+        if sql:
+            return {"name": "execute_sql", "arguments": {"query": sql}}
+    else:
+        answers = _section_extract_answers(body)
+        if answers is not None:
+            return {"name": "commit_final_answer", "arguments": {"answers": answers}}
+    return None
+
 
 def _try_rescue_partial_commit(raw_json: str) -> Optional[List[str]]:
     """Extract committed answers from a truncated JSON commit_final_answer body.
@@ -1034,6 +1372,13 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
     """
     if not content:
         return None
+
+    # xLAM-style bracket-list (JSON or Python-call form). Try first because
+    # it's a strong signal — the head must literally start with `[` and a
+    # known tool name, so it can't false-trigger on prose.
+    bracket = _try_rescue_bracket_list(content)
+    if bracket is not None:
+        return bracket
 
     # XML form with closing tag — unambiguous.
     m = _RESCUE_TOOL_CALL_XML_RE.search(content)
@@ -1084,6 +1429,14 @@ def rescue_tool_call_from_text(content: str) -> Optional[Dict[str, Any]]:
         if m:
             sql = m.group(1).encode().decode("unicode_escape", errors="ignore")
             return {"name": "execute_sql", "arguments": {"query": sql}}
+
+    # Section-marker form: [SQL] UPDATE ..., [Final Answer] X, [Thoughts]
+    # ... [SQL] ...  (xLAM-70B harness pattern). Run after the strict
+    # JSON/kwarg parsers but before the generic ```sql fence``` fallback so
+    # an explicit `[Final Answer]` section beats an incidental sql fence.
+    section = _try_rescue_section_marker(content)
+    if section is not None:
+        return section
 
     # ```sql fence```
     m = _RESCUE_SQL_FENCE_RE.search(content)

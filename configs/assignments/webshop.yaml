@@ -2,10 +2,10 @@ import: definition.yaml
 
 concurrency:
   task:
-    webshop-env_train: 32
-    webshop-std: 32
+    # webshop-env_train: 32
+    webshop-std: 16
   agent:
-    qwen3-4b-instruct: 32
+    qwen3-4b-instruct: 16
 
 assignments:
   - agent:
@@ -14,5 +14,14 @@ assignments:
       # - webshop-env_train
       - webshop-std
 
-output: "outputs/webshop/{TIMESTAMP}-test-harness"
+
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-baseline"
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-with_harness"
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-no_h2"
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-no_h3"
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-no_h4"
+# output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-no_h5"
+output: "outputs/qwen3-4b-instruct/webshop/{TIMESTAMP}-only-h3-h5"
+
+
 trials: 1

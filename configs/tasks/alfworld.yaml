@@ -34,9 +34,9 @@ alfworld-std:
     name: alfworld-std
     split: "new_std"
     enabled: true
-    h2: true
+    h2: false
     h3: true
-    h4: true
+    h4: false
     h5: true
     h5_top_k: 1
 
